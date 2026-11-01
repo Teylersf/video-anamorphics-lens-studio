@@ -1,0 +1,5 @@
+# Apple Silicon setup: native ARM64 CPython 3.13, macOS 14+.
+# This is a compatibility pin, not a claim to use the latest PyTorch release.
+# Apple documents 2.11.0 MPS requirements: https://developer.apple.com/metal/pytorch/
+-r tools/anamorphic-studio/requirements.txt
+torch==2.11.0

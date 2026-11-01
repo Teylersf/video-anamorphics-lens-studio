@@ -1,4 +1,4 @@
-"""Reproduce the README comparisons with the real CUDA renderer. GPL-2.0-only.
+"""Reproduce the README comparisons with the actual renderer. GPL-2.0-only.
 
 Downloads only a fixed, hash-pinned CC0 photograph when no local source exists.
 No images are painted into the processed frame; Pillow only adds layout/labels.
@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 import torch
 
 from studio_engine import StudioRenderer, normalize_settings
+from runtime_backend import select_device, backend_info
 
 ROOT = Path(__file__).resolve().parents[2]
 URL = 'https://upload.wikimedia.org/wikipedia/commons/0/01/Hong_Kong_night_street_2.jpg'
@@ -30,7 +31,7 @@ def font(size, bold=False):
     return ImageFont.load_default(size=size)
 
 
-def board(before, after, label):
+def board(before, after, label, renderer):
     panel_width, gap, margin, header, footer = 768, 16, 24, 104, 64
     panel_height = round(panel_width * before.height / before.width)
     width, height = 2 * panel_width + gap + 2 * margin, panel_height + header + footer
@@ -40,7 +41,7 @@ def board(before, after, label):
     draw.text((margin, 49), 'BEFORE', font=font(26, True), fill='#f3f3ed')
     draw.text((margin + panel_width + gap, 49), 'AFTER  /  ' + label, font=font(26, True), fill='#f3f3ed')
     draw.text((margin, 82), 'Same source photograph', font=font(13), fill='#a9b3b5')
-    draw.text((margin + panel_width + gap, 82), 'Actual CUDA render - deliberately stronger than default', font=font(13), fill='#a9b3b5')
+    draw.text((margin + panel_width + gap, 82), f'Actual {renderer} render - deliberately stronger than default', font=font(13), fill='#a9b3b5')
     size = (panel_width, panel_height)
     canvas.paste(before.resize(size, Image.Resampling.LANCZOS), (margin, header))
     canvas.paste(after.resize(size, Image.Resampling.LANCZOS), (margin + panel_width + gap, header))
@@ -55,8 +56,9 @@ def main():
     parser.add_argument('--source', type=Path, default=ROOT / 'out/readme-extreme-demo/source.jpg')
     parser.add_argument('--output', type=Path, default=ROOT / 'docs/images')
     args = parser.parse_args()
-    if not torch.cuda.is_available():
-        raise ValueError('CUDA-enabled PyTorch is required to reproduce the actual effects')
+    device = select_device()
+    backend = backend_info(device)
+    renderer = {'mps': 'Metal', 'cuda': 'CUDA', 'cpu': 'CPU'}[device.type]
     if not args.source.exists():
         args.source.parent.mkdir(parents=True, exist_ok=True)
         request = urllib.request.Request(URL, headers={'User-Agent': 'VideoAnamorphicsLensStudio/0.2 (https://github.com/Teylersf/video-anamorphics-lens-studio)'})
@@ -75,13 +77,13 @@ def main():
         before.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
     args.output.mkdir(parents=True, exist_ok=True)
     values = np.array(before, dtype=np.uint8)
-    tensor = torch.from_numpy(values).to('cuda', dtype=torch.float32).permute(2, 0, 1) / 255
+    tensor = torch.from_numpy(values).to(device, dtype=torch.float32).permute(2, 0, 1) / 255
     original = tensor.clone()
     receipt = {'source_page': SOURCE_PAGE, 'source_author': 'Wilfredor', 'source_license': 'CC0-1.0',
                'source_sha256': source_hash, 'original_dimensions': list(source_size),
                'render_dimensions': list(before.size), 'transfer': 'srgb', 'frame_index': 0,
                'renderer_sha256': hashlib.sha256((ROOT / 'tools/anamorphic-studio/studio_engine.py').read_bytes()).hexdigest(),
-               'torch_version': torch.__version__, 'gpu': torch.cuda.get_device_name(0), 'renders': {}}
+               'torch_version': torch.__version__, 'gpu': backend['gpu'], 'backend': backend, 'renders': {}}
     with torch.inference_mode():
         for name, label in (('blue', 'EXTREME BLUE'), ('amber', 'EXTREME AMBER + FOCUS FALLOFF')):
             preset = ROOT / 'examples/looks' / f'extreme-{name}.json'
@@ -92,7 +94,7 @@ def main():
             assert 0 <= float(rendered.min()) <= float(rendered.max()) <= 1
             pixels = (rendered.permute(1, 2, 0).clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
             after = Image.fromarray(pixels)
-            composite = board(before, after, label)
+            composite = board(before, after, label, renderer)
             output = args.output / f'extreme-{name}-before-after.jpg'
             composite.save(output, format='JPEG', quality=90, subsampling=0, optimize=True)
             difference = np.abs(pixels.astype(np.float32) - values.astype(np.float32)) / 255

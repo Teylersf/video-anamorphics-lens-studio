@@ -21,30 +21,47 @@ def running():
         return False
 
 
-def main():
-    local_python = ROOT / '.venv-studio' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
-    if local_python.exists() and Path(sys.executable).absolute() != local_python.absolute():
-        return subprocess.call([str(local_python), str(Path(__file__).resolve()), *sys.argv[1:]], cwd=ROOT)
-    if '--stop' in sys.argv:
+def _windows():
+    return os.name == 'nt'
+
+
+def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    # Shutdown only needs the standard library. It must not install/build the
+    # app, launch an interpreter/server, or signal a terminal's process group.
+    if '--stop' in arguments:
+        if not running():
+            print('Anamorphic Studio is not running.')
+            return 0
         request = urllib.request.Request(URL + '/api/shutdown', data=b'', method='POST',
                                          headers={'X-Studio-Client': 'anamorphic-studio'})
         try:
             with urllib.request.urlopen(request, timeout=15):
                 print('Anamorphic Studio is stopping.')
-        except OSError:
-            print('Anamorphic Studio is not running.')
+        except OSError as error:
+            raise RuntimeError('Could not stop Anamorphic Studio through its local shutdown endpoint.') from error
         return 0
+    local_python = ROOT / '.venv-studio' / ('Scripts/python.exe' if _windows() else 'bin/python')
+    # Compare interpreter names without resolving symlinks: a POSIX venv's
+    # python may point to the same binary while selecting a different sys.prefix.
+    if local_python.exists() and Path(sys.executable).absolute() != local_python.absolute():
+        return subprocess.call([str(local_python), str(Path(__file__).resolve()), *arguments], cwd=ROOT)
     if not running():
-        npm = 'npm.cmd' if os.name == 'nt' else 'npm'
+        npm = 'npm.cmd' if _windows() else 'npm'
         if not (ROOT / 'app/node_modules').is_dir():
             subprocess.run([npm, 'ci'], cwd=ROOT / 'app', check=True)
         subprocess.run([npm, 'run', 'build'], cwd=ROOT / 'app', check=True)
         logs = ROOT / 'out/anamorphic-studio'
         logs.mkdir(parents=True, exist_ok=True)
         with (logs / 'server.log').open('ab') as log:
+            process_options = {'stdin': subprocess.DEVNULL}
+            if _windows():
+                process_options['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+            else:
+                process_options['start_new_session'] = True
             process = subprocess.Popen([sys.executable, 'tools/anamorphic-studio/server.py'], cwd=ROOT,
                                        stdout=log, stderr=subprocess.STDOUT,
-                                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                                       **process_options)
         (logs / 'server.pid').write_text(str(process.pid))
         for _ in range(120):
             if running():
@@ -55,7 +72,7 @@ def main():
         else:
             raise RuntimeError('Studio is still starting. See out/anamorphic-studio/server.log.')
     print(URL)
-    if '--no-browser' not in sys.argv:
+    if '--no-browser' not in arguments:
         webbrowser.open(URL)
     return 0
 

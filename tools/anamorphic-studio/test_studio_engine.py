@@ -1,6 +1,6 @@
-"""Focused CPU contract/CUDA behavior tests; opt in to full 8K with --8k.
+"""Focused CPU/CUDA/MPS behavior tests; opt in to full 8K with --8k.
 
-Run with C:\\Python313\\python.exe test_studio_engine.py [--8k]. Stress timing is
+Run with python test_studio_engine.py [--8k]. Stress timing is
 effect-only host/GPU processing, never sensor FPS or end-to-end export speed.
 """
 from __future__ import annotations
@@ -15,7 +15,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from studio_engine import (DEFAULTS, PROFILES, StudioRenderer, normalize_settings,
-                           to_display_rgb, _decode, _encode, _spline, _PREVIEW_MATRICES)
+                           to_display_rgb, _decode, _encode, _spline, _PREVIEW_MATRICES,
+                           _adaptive_area, _area_resize, _grain_noise)
 
 STRESS_8K = "--8k" in sys.argv
 if STRESS_8K:
@@ -88,10 +89,66 @@ class SettingsTests(unittest.TestCase):
             StudioRenderer({}, "not-a-transfer")
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class CudaTests(unittest.TestCase):
+class CpuTests(unittest.TestCase):
+    device = "cpu"
+
+    def test_decoder_style_noncontiguous_rgb(self):
+        frame = torch.linspace(0, 1, 31 * 47 * 3, device=self.device).reshape(31, 47, 3).permute(2, 0, 1)
+        self.assertFalse(frame.is_contiguous())
+        original = frame.clone()
+        renderer = StudioRenderer({**PROFILES["vintage"], "bokeh": .3})
+        actual = renderer(frame, 5)
+        expected = renderer(frame.contiguous(), 5)
+        self.assertEqual(tuple(actual.shape), (3, 31, 47))
+        self.assertEqual(actual.device, frame.device)
+        self.assertTrue(actual.is_contiguous())
+        self.assertLess(float((actual - expected).abs().max()), 3e-4)
+        self.assertTrue(torch.equal(frame, original))
+
+    def test_nondivisible_area_and_real_downsample_shape(self):
+        import torch.nn.functional as functional
+        for shape, size in (((3, 7, 4097), (3, 1366)), ((3, 53, 79), (17, 23)),
+                            ((3, 1, 17), (1, 6)), ((3, 19, 1), (7, 1))):
+            source = torch.linspace(0, 1, math.prod(shape), dtype=torch.float32).reshape(shape)
+            reference = functional.interpolate(source[None], size=size, mode="area")[0]
+            actual = _adaptive_area(source.to(self.device), size).cpu()
+            self.assertLess(float((actual - reference).abs().max()), 2e-4)
+            self.assertEqual(tuple(actual.shape), (3, *size))
+            routed = _area_resize(source.to(self.device), size).cpu()
+            self.assertLess(float((routed - reference).abs().max()), 2e-4)
+        frame = torch.full((3, 7, 4097), .18, device=self.device)
+        frame[:, 2:5, 2300:2350] = .95
+        original = frame.clone()
+        out = StudioRenderer({**PROFILES["vintage"], "bokeh": .4})(frame, 9)
+        self.assertEqual(out.device, frame.device)
+        self.assertEqual(tuple(out.shape), tuple(frame.shape))
+        self.assertTrue(bool(torch.isfinite(out).all()))
+        self.assertTrue(torch.equal(frame, original))
+        self.assertGreaterEqual(float(out.min()), 0)
+        self.assertLessEqual(float(out.max()), 1)
+
+    def test_grain_scalar_reference_and_device_noise(self):
+        # Scalar Python integer reference: no CUDA/MPS bitwise implementation
+        # can change the established hash stream, including rows crossing128.
+        seed, cell, start, rows, width = 0xFFFFFFFF, 3, 127, 7, 29
+        expected = []
+        for y in range(start, start + rows):
+            line = []
+            for x in range(width):
+                value = ((x // cell) * 374761393 + (y // cell) * 668265263 + seed) & 0xFFFFFFFF
+                value = ((value ^ (value >> 13)) * 1274126177) & 0xFFFFFFFF
+                value ^= value >> 16
+                line.append((value & 65535) / 32768 - 1)
+            expected.append(line)
+        expected = torch.tensor(expected, dtype=torch.float32)
+        noise_device = "cpu" if self.device == "mps" else self.device
+        nx = torch.arange(width, device=noise_device, dtype=torch.int64).div_(cell, rounding_mode="floor")[None]
+        actual = _grain_noise(nx, start, rows, cell, seed)
+        self.assertTrue(torch.equal(actual.cpu(), expected))
+        if self.device == "mps":
+            self.assertTrue(torch.equal(actual.to("mps").cpu(), expected))
     def test_off_exact_all_transfers_no_input_change(self):
-        frame = torch.linspace(0, 1, 3 * 19 * 33, device="cuda").reshape(3, 19, 33)
+        frame = torch.linspace(0, 1, 3 * 19 * 33, device=self.device).reshape(3, 19, 33)
         original = frame.clone()
         frame.requires_grad_(True)
         for transfer in ("bt709", "srgb", "pq", "hlg"):
@@ -102,7 +159,7 @@ class CudaTests(unittest.TestCase):
         self.assertTrue(torch.equal(frame, original))
 
     def test_transfer_roundtrip_and_hdr_preview(self):
-        x = torch.linspace(0, 1, 3 * 47 * 59, device="cuda").reshape(3, 47, 59)
+        x = torch.linspace(0, 1, 3 * 47 * 59, device=self.device).reshape(3, 47, 59)
         for transfer, tolerance in (("srgb", 5e-7), ("bt709", 3e-4),
                                     ("pq", 3e-5), ("hlg", 5e-7)):
             roundtrip = _encode(_decode(x, transfer), transfer)
@@ -114,15 +171,15 @@ class CudaTests(unittest.TestCase):
             self.assertGreaterEqual(float(preview.min()), 0)
             self.assertLessEqual(float(preview.max()), 1)
         # Equal-energy white remains neutral through the primary matrix.
-        white = torch.full((3, 3, 5), .6, device="cuda")
+        white = torch.full((3, 3, 5), .6, device=self.device)
         p = to_display_rgb(white, "pq", "bt2020")
         self.assertLess(float((p[0] - p[2]).abs().max()), 1e-5)
         with self.assertRaises(ValueError):
             to_display_rgb(x, "bt709", "made-up")
 
     def test_common_sd_p3_preview_primaries(self):
-        white = torch.full((3, 3, 7), .55, device="cuda")
-        colored = torch.tensor((.23, .48, .72), device="cuda")[:, None, None].expand(3, 3, 7).contiguous()
+        white = torch.full((3, 3, 7), .55, device=self.device)
+        colored = torch.tensor((.23, .48, .72), device=self.device)[:, None, None].expand(3, 3, 7).contiguous()
         for primaries in _PREVIEW_MATRICES:
             for transfer in ("bt709", "srgb", "pq", "hlg"):
                 out = to_display_rgb(white, transfer, primaries)
@@ -132,14 +189,14 @@ class CudaTests(unittest.TestCase):
                 self.assertEqual(tuple(out.shape), tuple(white.shape))
             out = to_display_rgb(colored, "srgb", primaries)
             linear = _decode(colored, "srgb")
-            matrix = torch.tensor(_PREVIEW_MATRICES[primaries], device="cuda", dtype=torch.float32)
+            matrix = torch.tensor(_PREVIEW_MATRICES[primaries], device=self.device, dtype=torch.float32)
             expected = _encode((matrix @ linear[:, 0, 0]).clamp_min(0)[:, None, None], "srgb")
             self.assertLess(float((out - expected).abs().max()), 1e-6, primaries)
             self.assertGreaterEqual(float(out.min()), 0)
             self.assertLessEqual(float(out.max()), 1)
 
     def test_normalized_smooth_psf_no_rectangular_plateau(self):
-        point = torch.zeros((1, 17, 513), device="cuda")
+        point = torch.zeros((1, 17, 513), device=self.device)
         point[0, 8, 256] = 1
         result = _spline(point, 75, -1)
         line = result[0, 8]
@@ -149,11 +206,11 @@ class CudaTests(unittest.TestCase):
         self.assertTrue(bool((tail[:-1] >= tail[1:] - 1e-7).all()))
         self.assertGreater(float(tail[3]), float(tail[25]))
         self.assertGreater(float(tail[25]), float(tail[55]))
-        uniform = torch.full((3, 5, 7), .4, device="cuda")
+        uniform = torch.full((3, 5, 7), .4, device=self.device)
         self.assertLess(float((_spline(uniform, 20, -1) - uniform).abs().max()), 1e-6)
 
     def test_flare_highlight_isolation_direction_and_tint(self):
-        dark = torch.full((3, 129, 257), .1, device="cuda")
+        dark = torch.full((3, 129, 257), .1, device=self.device)
         settings = neutral(flare=1., threshold=.8, flare_length=.22)
         render = StudioRenderer(settings)
         self.assertLess(float((render(dark) - dark).abs().max()), 1e-6)
@@ -167,25 +224,26 @@ class CudaTests(unittest.TestCase):
         self.assertTrue(torch.equal(scene[:, 62:67, 126:131], torch.ones_like(scene[:, 62:67, 126:131])))
 
     def test_grain_repeatability_no_global_rng_and_cache(self):
-        scene = torch.full((3, 37, 65), .4, device="cuda")
+        scene = torch.full((3, 37, 65), .4, device=self.device)
         renderer = StudioRenderer(neutral(grain=.6))
-        state = torch.cuda.get_rng_state().clone()
+        get_state = torch.cuda.get_rng_state if self.device == "cuda" else torch.mps.get_rng_state if self.device == "mps" else torch.get_rng_state
+        state = get_state().clone()
         a, b, c = renderer(scene, 3), renderer(scene, 3), renderer(scene, 4)
         self.assertTrue(torch.equal(a, b))
         self.assertFalse(torch.equal(a, c))
-        self.assertTrue(torch.equal(torch.cuda.get_rng_state(), state))
-        renderer(torch.zeros((3, 1, 1), device="cuda"))
+        self.assertTrue(torch.equal(get_state(), state))
+        renderer(torch.zeros((3, 1, 1), device=self.device))
         self.assertEqual(renderer._geometry_key[1:], (1, 1))
         self.assertEqual(sum(v.numel() for v in renderer._geometry.values()), 2)
         for shape in ((1, 17), (13, 1), (1, 1)):
-            out = StudioRenderer(PROFILES["vintage"])(torch.full((3, *shape), .4, device="cuda"))
+            out = StudioRenderer(PROFILES["vintage"])(torch.full((3, *shape), .4, device=self.device))
             self.assertEqual(tuple(out.shape), (3, *shape))
             self.assertTrue(bool(torch.isfinite(out).all()))
 
     def test_focus_band_and_edge_clamp(self):
         h, w = 129, 257
-        yy = torch.arange(h, device="cuda")[:, None]
-        xx = torch.arange(w, device="cuda")[None]
+        yy = torch.arange(h, device=self.device)[:, None]
+        xx = torch.arange(w, device=self.device)[None]
         checker = ((xx + yy) % 2).float() * .5 + .2
         scene = checker.expand(3, -1, -1).contiguous()
         settings = neutral(bokeh=1., focus_y=.5, focus_width=.4, ovality=3.)
@@ -194,12 +252,12 @@ class CudaTests(unittest.TestCase):
         self.assertLess(float(result[:, :20].var()), float(scene[:, :20].var()) * .2)
         full_band = StudioRenderer({**settings, "focus_width": 1.})(scene)
         self.assertLess(float((full_band - scene).abs().max()), 1e-6)
-        constant = torch.full((3, 67, 131), .35, device="cuda")
+        constant = torch.full((3, 67, 131), .35, device=self.device)
         warp = StudioRenderer(neutral(distortion=-1., chromatic=1.))(constant)
         self.assertLess(float((warp - constant).abs().max()), 1e-6)
 
     def test_ghosts_and_all_settings_extremes(self):
-        frame = torch.zeros((3, 77, 131), device="cuda")
+        frame = torch.zeros((3, 77, 131), device=self.device)
         frame[:, 12:22, 95:105] = 1
         ghost = StudioRenderer(neutral(ghosts=1., threshold=.5))(frame)
         self.assertGreater(float(ghost[:, 45:70, 5:55].max()), .001)
@@ -215,9 +273,9 @@ class CudaTests(unittest.TestCase):
 
     def test_validation(self):
         renderer = StudioRenderer({})
-        valid = torch.zeros((3, 9, 11), device="cuda")
-        for frame in (torch.zeros((3, 9, 11)), valid.double(), torch.zeros((2, 9, 11), device="cuda"),
-                      torch.empty((3, 0, 11), device="cuda")):
+        valid = torch.zeros((3, 9, 11), device=self.device)
+        for frame in (torch.empty((3, 9, 11), device="meta"), valid.double(), torch.zeros((2, 9, 11), device=self.device),
+                      torch.empty((3, 0, 11), device=self.device)):
             with self.assertRaises((TypeError, ValueError)):
                 renderer(frame)
         for value in (-.01, 1.01, math.nan, math.inf):
@@ -236,10 +294,12 @@ class CudaTests(unittest.TestCase):
 
     @unittest.skipUnless(STRESS_8K, "use --8k during an exclusive GPU interval")
     def test_full_8k_cuda_memory(self):
+        if self.device != "cuda":
+            self.skipTest("8K allocator stress is CUDA-only")
         renderer = StudioRenderer({**PROFILES["vintage"], "bokeh": .35})
-        renderer(torch.full((3, 96, 160), .3, device="cuda"))
+        renderer(torch.full((3, 96, 160), .3, device=self.device))
         torch.cuda.synchronize()
-        frame = torch.full((3, 4320, 7680), .18, device="cuda")
+        frame = torch.full((3, 4320, 7680), .18, device=self.device)
         frame[:, 1800:2100, 4500:4750] = .98
         torch.cuda.synchronize()
         baseline = torch.cuda.memory_allocated()
@@ -260,6 +320,37 @@ class CudaTests(unittest.TestCase):
         self.assertEqual(sum(v.numel() for v in renderer._geometry.values()), 12000)
         print(f"\n8K effect-only: CUDA {start.elapsed_time(end):.2f}ms, wall {elapsed:.3f}s, "
               f"peak total {peak / 1024**3:.3f}GiB, incremental {(peak-baseline) / 1024**3:.3f}GiB")
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
+class CudaTests(CpuTests):
+    device = "cuda"
+
+
+@unittest.skipUnless(torch.backends.mps.is_available(), "Metal MPS unavailable")
+class MpsTests(CpuTests):
+    device = "mps"
+
+
+class BackendComparisonTests(unittest.TestCase):
+    def test_available_accelerators_against_cpu(self):
+        devices = []
+        if torch.cuda.is_available():
+            devices.append("cuda")
+        if torch.backends.mps.is_available():
+            devices.append("mps")
+        if not devices:
+            self.skipTest("No CUDA/MPS hardware; CPU behavior suite still runs")
+        frame = torch.linspace(0, 1, 3 * 39 * 67).reshape(3, 39, 67)
+        settings = {**PROFILES["vintage"], "bokeh": .55, "focus_width": .35}
+        for transfer in ("bt709", "srgb", "pq", "hlg"):
+            expected = StudioRenderer(settings, transfer)(frame, 6)
+            for device in devices:
+                actual = StudioRenderer(settings, transfer)(frame.to(device), 6).cpu()
+                error = (actual - expected).abs()
+                tolerance = 2e-4 if device == "cuda" else 3e-3
+                self.assertLess(float(error.max()), tolerance, (device, transfer))
+                self.assertLess(float(error.mean()), tolerance / 10, (device, transfer))
 
 
 if __name__ == "__main__":

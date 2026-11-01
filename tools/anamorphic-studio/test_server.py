@@ -132,6 +132,61 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
+    def test_status_cpu_ready_and_explicit_unavailable_device(self):
+        import runtime_backend
+        with patch.dict('os.environ', {'STUDIO_DEVICE': 'cpu'}), patch.object(server.shutil, 'which', return_value='/tool'):
+            response = self.client.get('/api/status')
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json()['ready'])
+            self.assertEqual(response.json()['device'], 'cpu')
+            self.assertFalse(response.json()['accelerated'])
+        with patch.object(runtime_backend, 'backend_info', side_effect=RuntimeError('Metal unavailable')):
+            response = self.client.get('/api/status')
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(response.json()['ready'])
+            self.assertEqual(response.json()['reason'], 'Metal unavailable')
+
+    def test_actual_cpu_preview_resizes_and_publishes_jpegs(self):
+        self._actual_preview('cpu')
+
+    def test_actual_mps_preview_resizes_and_publishes_jpegs(self):
+        import torch
+        if not torch.backends.mps.is_available():
+            self.skipTest('Actual Metal hardware is unavailable')
+        self._actual_preview('mps')
+
+    def _actual_preview(self, device):
+        import numpy as np
+        from PIL import Image
+        media = self.upload()
+        pixels = np.zeros((360, 640, 3), dtype=np.uint16)
+        pixels[100:150, 250:350] = 65535
+        with patch.dict('os.environ', {'STUDIO_DEVICE': device}), patch.object(
+                server, 'frame_at', return_value=(pixels, .5)):
+            response = self.client.post('/api/preview', headers=CLIENT_HEADER,
+                json={'media_id': media['id'], 'time': .5, 'width': 320})
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result['backend']['device'], device)
+        self.assertEqual((result['width'], result['height']), (320, 180))
+        for name in ('original_url', 'processed_url'):
+            asset = self.client.get(result[name])
+            self.assertEqual(asset.status_code, 200)
+            import io
+            with Image.open(io.BytesIO(asset.content)) as image:
+                self.assertEqual(image.size, (320, 180))
+        self.assertFalse(server.GPU_LOCK.locked())
+
+    def test_preview_device_error_releases_renderer(self):
+        import runtime_backend
+        media = self.upload()
+        with patch.object(runtime_backend, 'select_device', side_effect=RuntimeError('Metal unavailable')):
+            response = self.client.post('/api/preview', headers=CLIENT_HEADER,
+                json={'media_id': media['id']})
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn('Metal unavailable', response.text)
+        self.assertFalse(server.GPU_LOCK.locked())
+
     def test_post_header_protection_and_browser_origin(self):
         for path, body in (("/api/media", None), ("/api/preview", {}),
                            ("/api/jobs", {}), ("/api/jobs/missing/cancel", {}),

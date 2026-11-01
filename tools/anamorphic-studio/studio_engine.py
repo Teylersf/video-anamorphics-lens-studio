@@ -1,10 +1,18 @@
-"""Original single-frame CUDA lens/film interpretation for Anamorphic Studio.
+"""Original single-frame PyTorch lens/film interpretation for Anamorphic Studio.
 
 Spatial light is extracted/composited in relative linear light. Smooth,
 unit-energy three-box spline PSFs avoid a rectangular streak footprint. The
 working light canvas is at most 1536 pixels per axis; distortion is sampled in
 128-row strips, so no full-resolution sampling grid or frame history is kept.
 Only one geometry's 1-D coordinates are cached. Calls must be serialized.
+
+CPU, CUDA and Metal MPS float32 frames are accepted. CUDA math is unchanged.
+MPS avoids unsupported nondivisible adaptive pooling with separable float32
+prefix-sum means, and computes only integer grain-noise tiles on CPU before
+transferring their float32 results to MPS. All lens/color stages stay on the
+input device; no global automatic CPU fallback is enabled. Floating backend
+rounding can differ, especially PQ and cumulative sums; it is not bit-exact
+across devices. MPS hardware validation is separate from CPU/CUDA tests.
 
 This is an artistic approximation, not an optical lens calibration, depth
 reconstruction, extra field of view, desqueeze, sensor mode or HDR restoration.
@@ -100,14 +108,14 @@ def _transfer_name(transfer):
 def _validate_frame(frame):
     if not isinstance(frame, torch.Tensor) or frame.dtype != torch.float32:
         raise TypeError("frame must be a float32 torch.Tensor")
-    if frame.device.type != "cuda":
-        raise ValueError("frame must be on CUDA")
+    if frame.device.type not in {"cpu", "cuda", "mps"}:
+        raise ValueError("frame must be on CPU, CUDA or Metal MPS")
     if frame.ndim != 3 or frame.shape[0] != 3 or min(frame.shape[1:]) < 1:
         raise ValueError("frame must be 3xHxW with positive dimensions")
     h, w = frame.shape[1:]
     if max(h, w) > 8192 or h * w > _MAX_PIXELS:
         raise ValueError("frame exceeds 8192 per axis or 35.7 megapixels")
-    lo, hi = torch.aminmax(frame)
+    lo, hi = (frame.amin(), frame.amax()) if frame.device.type == "mps" else torch.aminmax(frame)
     low, high = lo.item(), hi.item()
     if not math.isfinite(low) or not math.isfinite(high) or low < 0 or high > 1:
         raise ValueError("encoded RGB must be finite and within 0..1")
@@ -174,6 +182,52 @@ def _spline(image, support, axis):
     for _ in range(3):
         image = _box(image, radius, axis)
     return image
+
+
+def _adaptive_area(image, size):
+    """Separable adaptive means with floor/ceil windows, no adaptive-pool op.
+
+    MPS's adaptive_avg_pool2d rejects some nondivisible dimensions. The same
+    spatial windows can be averaged with float32 cumulative sums and small
+    int32 index vectors. Only those indices are constructed on CPU, never a
+    float image. Maximum dimensions are already bounded by frame validation.
+    """
+    def axis_mean(value, length, axis):
+        old = value.shape[axis]
+        if old == length:
+            return value
+        starts = torch.tensor([i * old // length for i in range(length)],
+                              dtype=torch.int32, device=value.device)
+        ends = torch.tensor([((i + 1) * old + length - 1) // length for i in range(length)],
+                            dtype=torch.int32, device=value.device)
+        prefix = value.cumsum(dim=axis)
+        prefix = F.pad(prefix, (1, 0) if axis == -1 else (0, 0, 1, 0))
+        total = prefix.index_select(axis, ends) - prefix.index_select(axis, starts)
+        shape = [1] * value.ndim
+        shape[axis] = length
+        return total / (ends - starts).to(dtype=value.dtype).reshape(shape)
+    h, w = image.shape[-2:]
+    oh, ow = size
+    # Minimize the intermediate image rather than retaining two full frames.
+    if h * ow <= oh * w:
+        return axis_mean(axis_mean(image, ow, -1), oh, -2).clamp_(0, 1)
+    return axis_mean(axis_mean(image, oh, -2), ow, -1).clamp_(0, 1)
+
+
+def _area_resize(image, size):
+    h, w = image.shape[-2:]
+    if image.device.type == "mps" and (h % size[0] or w % size[1]):
+        return _adaptive_area(image, size)
+    return F.interpolate(image[None], size=size, mode="area")[0]
+
+
+def _grain_noise(nx, start, rows, cell, seed):
+    """Original 32-bit hash expressed in int64; CPU/CUDA noise is value-exact."""
+    ny = torch.arange(start, start + rows, device=nx.device, dtype=torch.int64).div_(cell, rounding_mode="floor")[:, None]
+    hashed = (nx * 374761393 + ny * 668265263 + seed).bitwise_and_(0xFFFFFFFF)
+    hashed = ((hashed ^ (hashed >> 13)) * 1274126177).bitwise_and_(0xFFFFFFFF)
+    hashed.bitwise_xor_(hashed >> 16)
+    return hashed.bitwise_and_(65535).to(torch.float32).mul_(1 / 32768).sub_(1)
 
 
 @torch.inference_mode()
@@ -266,7 +320,7 @@ class StudioRenderer:
         brightness = image.amax(dim=0)
         over = (brightness - threshold + knee).clamp_min_(0)
         mask = _smoothstep(over / (2 * knee)) * (over / (1 - threshold + knee))
-        seed = F.interpolate((image * mask[None])[None], size=size, mode="area")[0]
+        seed = _area_resize(image * mask[None], size)
         result = torch.zeros_like(seed)
         tint_values = tuple(blue * (1 - s["tint"]) + amber * s["tint"]
                             for blue, amber in zip((.18, .48, 1.), (1., .52, .16)))
@@ -309,7 +363,7 @@ class StudioRenderer:
             return image
         h, w = image.shape[1:]
         factor = max(1, math.ceil(max(h, w) / 1536))
-        work = F.interpolate(image[None], size=(max(1, math.ceil(h / factor)), max(1, math.ceil(w / factor))), mode="area")[0]
+        work = _area_resize(image, (max(1, math.ceil(h / factor)), max(1, math.ceil(w / factor))))
         radius = work.shape[2] * .004 * s["bokeh"]
         work = _spline(_spline(work, max(1., radius), -1), max(1., radius * s["ovality"]), -2)
         blur = F.interpolate(work[None], size=(h, w), mode="bilinear", align_corners=True)[0]
@@ -336,14 +390,15 @@ class StudioRenderer:
         if s["grain"]:
             # Local integer coordinate hash; never changes torch's global RNG.
             cell = max(1, round(w / 1920))
-            nx = torch.arange(w, device=encoded.device, dtype=torch.int64).div_(cell, rounding_mode="floor")[None]
+            # MPS lacks the full int64 bitwise hash path. Transfer only a bounded
+            # 128-row float32 noise tile; color/geometry and compositing stay MPS.
+            noise_device = torch.device("cpu") if encoded.device.type == "mps" else encoded.device
+            nx = torch.arange(w, device=noise_device, dtype=torch.int64).div_(cell, rounding_mode="floor")[None]
             seed = (0xA341316C + frame_index * 0x9E3779B9) & 0xFFFFFFFF
             for start in range(0, h, _TILE_ROWS):
-                ny = torch.arange(start, min(h, start + _TILE_ROWS), device=encoded.device, dtype=torch.int64).div_(cell, rounding_mode="floor")[:, None]
-                hashed = (nx * 374761393 + ny * 668265263 + seed).bitwise_and_(0xFFFFFFFF)
-                hashed = ((hashed ^ (hashed >> 13)) * 1274126177).bitwise_and_(0xFFFFFFFF)
-                hashed.bitwise_xor_(hashed >> 16)
-                noise = hashed.bitwise_and_(65535).to(torch.float32).mul_(1 / 32768).sub_(1)
+                noise = _grain_noise(nx, start, min(h, start + _TILE_ROWS) - start, cell, seed)
+                if encoded.device.type == "mps":
+                    noise = noise.to(encoded.device)
                 tile = encoded[:, start:start + _TILE_ROWS]
                 envelope = (tile * (1 - tile)).clamp_min(0).sqrt_()
                 tile.add_(noise[None] * envelope, alpha=a * s["grain"] * .055).clamp_(0, 1)

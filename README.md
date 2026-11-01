@@ -4,7 +4,7 @@
 
 A local GPU video app for shaping anamorphic lens character, cinematic light
 and film texture. Import footage, compare before/after, adjust the look and
-export at the original resolution—tested through **7680×4320, 10-bit HDR**.
+export at the original resolution—CUDA-tested through **7680×4320, 10-bit HDR**.
 
 **Local processing. Original files preserved. Match-source export by default.**
 No camera firmware, cloud account or Vercel deployment is required.
@@ -45,7 +45,7 @@ Photo: [Wilfredor, *Hong Kong night street 2*](https://commons.wikimedia.org/wik
 - Nineteen controls for smooth horizontal flares, blue/amber coating color,
   lens ghosts, bloom, halation, chromatic separation, distortion, vignette,
   grain, focus falloff, ovality and color adjustments.
-- GPU frame previews with a draggable before/after comparison and source
+- Frame previews with a draggable before/after comparison and source
   timeline, plus a rendered three-second preview with playback.
 - Save/load look settings, export progress, cancellation and verified downloads.
 - Source timing including VFR, display rotation, bit depth/chroma and compatible
@@ -58,9 +58,32 @@ detail, add field of view or turn lower-resolution footage into captured 8K.
 
 ## Run locally
 
+### Apple Silicon Mac
+
+Use native ARM64 Python 3.13, Node 22 and FFmpeg. On a Mac with the prerequisites
+installed, run these commands from the project folder:
+
+```bash
+bash "SETUP MAC.command"
+bash "START ANAMORPHIC STUDIO.command"
+```
+
+Setup installs the pinned Mac dependencies and builds the interface without
+starting the service. **STOP ANAMORPHIC STUDIO.command** stops it when requested.
+See [the Mac setup guide](docs/MACOS.md) for prerequisite installation, macOS
+versions and troubleshooting.
+
+Effects select CUDA, then Apple Metal/MPS, then CPU when using the default
+`STUDIO_DEVICE=auto`. CPU rendering is supported and can be much slower.
+An explicitly requested unavailable accelerator reports an error. Mac support
+is implemented with conditional tests; the Windows/CUDA results below do not
+establish Mac hardware performance or 8K throughput.
+
+### Windows / NVIDIA CUDA
+
 Tested on **Windows, Python 3.13, Node 22.19, RTX 3090 24 GB, CUDA-enabled
-PyTorch 2.11.0+cu126, PyAV 17 and FFmpeg 7.0.2**. A working NVIDIA CUDA GPU is
-required for effects; the UI and CPU contract tests do not require GPU rendering.
+PyTorch 2.11.0+cu126, PyAV 17 and FFmpeg 7.0.2**. CUDA accelerates effects on
+this configuration; the same engine also supports CPU rendering.
 
 1. Install Git, Python, Node and FFmpeg/ffprobe on PATH.
 2. Install CUDA-enabled PyTorch appropriate for your GPU using the
@@ -93,6 +116,12 @@ verified lossless codec settings where supported; other codecs use lossless
 encoding where available or their highest practical quality setting. Unsupported
 exact matches fail explicitly instead of silently changing format.
 
+On Mac, H.264/HEVC **Match source uses software lossless encoders** to retain
+that quality contract. VideoToolbox is used for supported high-quality HEVC
+delivery and H.264 preview encoding after a capability probe, with an explicit
+software fallback when necessary. VideoToolbox delivery is not labeled
+lossless. The result panel reports the codec, quality and audio outcome.
+
 Effects change the video pixels, so re-encoding is necessary. **Lossless codec
 encoding of processed YUV is not mathematically lossless RGB:** returning to
 the source chroma sampling/bit depth can discard information. Choose the
@@ -101,7 +130,7 @@ files can be substantially larger. ProRes is a high-quality editing codec,
 not a mathematically lossless one.
 
 See the [full setup, color/HDR notes, format limits and validation](tools/anamorphic-studio/README.md).
-The tested envelope is 8192 pixels per axis / 35.65 MP, with a 64 GiB import
+The CUDA-tested envelope is 8192 pixels per axis / 35.65 MP, with a 64 GiB import
 limit. HDR mastering/dynamic metadata is not rebuilt after effects and is
 reported explicitly. Alpha-channel match export is currently unsupported.
 

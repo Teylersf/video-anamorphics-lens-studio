@@ -1,5 +1,7 @@
-# Install CUDA-enabled PyTorch separately using pytorch.org for the target GPU.
-# The local project venv can reuse an existing CUDA install with --system-site-packages.
+# Shared HTTP/media dependencies; install a compatible PyTorch for your backend.
+# Windows/CUDA: use pytorch.org; a venv can reuse it with --system-site-packages.
+# Apple Silicon: install root requirements-macos.txt (includes this file + torch).
+# Metal/MPS and CPU setup details: docs/MACOS.md; no CUDA package is required on Mac.
 fastapi==0.139.0
 uvicorn==0.40.0
 python-multipart==0.0.22

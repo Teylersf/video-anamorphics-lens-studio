@@ -1,7 +1,7 @@
-"""CPU adapter contracts plus opt-in actual CUDA/codec integration tests.
+"""Portable adapter contracts and actual CPU-render/codec integration tests.
 
 python test_media_pipeline.py -v
-STUDIO_GPU_TESTS=1 enables small, real source-timing/audio/RGB16 round trips.
+Round trips run on CPU with software encoders, including on machines without a GPU.
 """
 import hashlib
 import os
@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -44,7 +45,7 @@ class Contracts(unittest.TestCase):
 
     def test_encoder_match_preserves_odd_geometry_with_cpu(self):
         info = dict(codec="h264", pixel_format="yuv444p", width=321, height=181, bit_depth=8)
-        plan = media._encoder_plan(info, "match")
+        plan = media._encoder_plan(info, "match", force_cpu=True, device_type="cpu")
         self.assertEqual(plan["encoder"], "libx264")
         self.assertEqual(plan["pixel"], "yuv444p")
         self.assertEqual(plan["quality"], "lossless codec")
@@ -52,28 +53,98 @@ class Contracts(unittest.TestCase):
     def test_unsupported_match_does_not_silently_change_codec(self):
         info = dict(codec="not_a_codec", pixel_format="yuv420p", width=320, height=180, bit_depth=8)
         with self.assertRaisesRegex(ValueError, "explicitly"):
-            media._encoder_plan(info, "match")
+            media._encoder_plan(info, "match", force_cpu=True, device_type="cpu")
 
     def test_alpha_match_fails_before_dropping_alpha(self):
         info = dict(codec="prores", pixel_format="yuva444p10le", width=320, height=180, bit_depth=10)
         with self.assertRaisesRegex(ValueError, "alpha"):
-            media._encoder_plan(info, "match")
+            media._encoder_plan(info, "match", force_cpu=True, device_type="cpu")
 
     def test_hevc422_uses_exact_format_cpu_fallback(self):
         info = dict(codec="hevc", pixel_format="yuv422p10le", width=320, height=180, bit_depth=10)
-        plan = media._encoder_plan(info, "match")
+        plan = media._encoder_plan(info, "match", force_cpu=True, device_type="cpu")
         self.assertEqual((plan["encoder"], plan["pixel"]), ("libx265", "yuv422p10le"))
 
     def test_lossless_is_rgb16_not_subsampled_yuv(self):
         info = dict(codec="h264", pixel_format="yuv420p", width=320, height=180, bit_depth=8)
-        plan = media._encoder_plan(info, "lossless")
+        plan = media._encoder_plan(info, "lossless", force_cpu=True, device_type="cpu")
         self.assertEqual((plan["codec"], plan["pixel"]), ("ffv1", "gbrp16le"))
+
+    def test_apple_match_never_selects_unproven_lossless_hardware(self):
+        info = dict(codec="hevc", pixel_format="yuv420p10le", width=320, height=180, bit_depth=10)
+        with mock.patch.object(media.platform, "system", return_value="Darwin"), \
+                mock.patch.object(media, "_hardware_works") as probe:
+            plan = media._encoder_plan(info, "match", device_type="mps")
+        self.assertEqual((plan["encoder"], plan["pixel"], plan["quality"]),
+                         ("libx265", "yuv420p10le", "lossless codec"))
+        self.assertIn("lossless=1", plan["options"]["x265-params"])
+        probe.assert_not_called()
+
+    def test_apple_delivery_uses_probed_10bit_videotoolbox(self):
+        import av
+        info = dict(codec="hevc", pixel_format="yuv420p10le", width=320, height=180, bit_depth=10)
+        with mock.patch.object(media.platform, "system", return_value="Darwin"), \
+                mock.patch.object(media, "_hardware_works", return_value=True) as probe, \
+                mock.patch.object(media, "_encoder_formats", return_value={"p010le"}), \
+                mock.patch.object(av, "codecs_available", av.codecs_available | {"hevc_videotoolbox"}):
+            plan = media._encoder_plan(info, "hevc", device_type="mps")
+        self.assertEqual((plan["encoder"], plan["pixel"], plan["quality"]),
+                         ("hevc_videotoolbox", "p010le", "highest quality"))
+        self.assertEqual(plan["options"]["global_quality"], "75")
+        self.assertEqual(plan["options"]["allow_sw"], "0")
+        probe.assert_called_once()
+
+    def test_apple_unavailable_hardware_keeps_10bit_software_delivery(self):
+        info = dict(codec="hevc", pixel_format="yuv420p10le", width=320, height=180, bit_depth=10)
+        with mock.patch.object(media.platform, "system", return_value="Darwin"), \
+                mock.patch.object(media, "_hardware_works", return_value=False):
+            plan = media._encoder_plan(info, "hevc", device_type="mps")
+        self.assertEqual((plan["encoder"], plan["pixel"]), ("libx265", "yuv420p10le"))
+        self.assertTrue(any("VideoToolbox" in warning for warning in plan["warnings"]))
+
+    def test_nvidia_lossless_options_unchanged(self):
+        import av
+        info = dict(codec="h264", pixel_format="yuv420p", width=320, height=180, bit_depth=8)
+        with mock.patch.object(media, "_hardware_works", return_value=True), \
+                mock.patch.object(media, "_encoder_formats", return_value={"yuv420p"}), \
+                mock.patch.object(av, "codecs_available", av.codecs_available | {"h264_nvenc"}):
+            plan = media._encoder_plan(info, "match", device_type="cuda")
+        self.assertEqual(plan["encoder"], "h264_nvenc")
+        self.assertEqual(plan["options"], {"preset": "p3", "tune": "lossless", "rc": "constqp", "qp": "0"})
+
+    def test_cpu_does_not_attempt_nvidia_codec_present_in_wheel(self):
+        info = dict(codec="h264", pixel_format="yuv420p", width=320, height=180, bit_depth=8)
+        with mock.patch.object(media.platform, "system", return_value="Linux"), \
+                mock.patch.object(media, "_hardware_works") as probe:
+            plan = media._encoder_plan(info, "match", device_type="cpu")
+        self.assertEqual(plan["encoder"], "libx264")
+        probe.assert_not_called()
+
+    def test_ffprobe_cleanup_does_not_kill_inherited_group(self):
+        process = mock.Mock(pid=123456)
+        process.poll.return_value = None
+        posix = SimpleNamespace(name="posix", getpgid=mock.Mock(return_value=888), killpg=mock.Mock())
+        with mock.patch.object(media, "os", posix):
+            media._stop_tree(process)
+        process.kill.assert_called_once()
+        posix.killpg.assert_not_called()
+
+    def test_owned_session_worker_cleanup_kills_its_group(self):
+        process = mock.Mock(pid=123456)
+        process.poll.return_value = None
+        posix = SimpleNamespace(name="posix", getpgid=mock.Mock(return_value=123456), killpg=mock.Mock())
+        with mock.patch.object(media, "os", posix), mock.patch.object(media, "signal", SimpleNamespace(SIGKILL=9)):
+            media._stop_tree(process)
+        posix.killpg.assert_called_once_with(123456, 9)
+        process.kill.assert_not_called()
 
 
 @unittest.skipUnless(shutil.which(media.FFMPEG) and shutil.which(media.FFPROBE), "FFmpeg required")
 class RealMedia(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.environment = mock.patch.dict(os.environ, {"STUDIO_DEVICE": "cpu"})
+        cls.environment.start()
         cls.temporary = tempfile.TemporaryDirectory(prefix="studio-media-test-")
         cls.folder = Path(cls.temporary.name)
         cls.source = cls.folder / "source.mov"
@@ -86,6 +157,10 @@ class RealMedia(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.temporary.cleanup()
+        cls.environment.stop()
+
+    def export_cpu(self, source, output, settings, **kwargs):
+        return media.export_video(source, output, {**settings, "_force_cpu_encoder": True}, **kwargs)
 
     def output(self, name):
         return self.folder / (self.id().split(".")[-1] + name)
@@ -131,19 +206,19 @@ class RealMedia(unittest.TestCase):
         event.set()
         output = self.output(".mov")
         with self.assertRaises(InterruptedError):
-            media.export_video(self.source, output, {}, cancel_event=event)
+            self.export_cpu(self.source, output, {}, cancel_event=event)
         self.assertFalse(output.exists())
 
     def test_match_container_change_requires_explicit_mode(self):
         output = self.output(".mp4")
         with self.assertRaisesRegex(ValueError, "requires .mov"):
-            media.export_video(self.source, output, {}, mode="match")
+            self.export_cpu(self.source, output, {}, mode="match")
         self.assertFalse(output.exists())
 
     def test_worker_failure_never_publishes(self):
         output = self.output(".mov")
         with self.assertRaises(ValueError):
-            media.export_video(self.source, output, {"invalid_setting": True})
+            self.export_cpu(self.source, output, {"invalid_setting": True})
         self.assertFalse(output.exists())
 
     def test_running_worker_cancel_stops_owned_process(self):
@@ -163,7 +238,7 @@ class RealMedia(unittest.TestCase):
             timer.start()
             try:
                 with self.assertRaises(InterruptedError):
-                    media.export_video(self.source, output, {}, cancel_event=event)
+                    self.export_cpu(self.source, output, {}, cancel_event=event)
             finally:
                 timer.cancel()
         self.assertIsNotNone(owned[0].poll())
@@ -182,24 +257,22 @@ class RealMedia(unittest.TestCase):
         with mock.patch.object(media.subprocess, "Popen", side_effect=sleeping_worker), \
              mock.patch.object(media, "inspect_media", return_value={}):
             with self.assertRaises(TimeoutError):
-                media.export_video(self.source, output, {"_timeout_seconds": 1})
+                self.export_cpu(self.source, output, {"_timeout_seconds": 1})
         self.assertIsNotNone(owned[0].poll())
         self.assertFalse(output.exists())
 
-    @unittest.skipUnless(os.environ.get("STUDIO_GPU_TESTS") == "1", "Set STUDIO_GPU_TESTS=1 for CUDA round trips")
-    def test_gpu_rotation_is_retained(self):
+    def test_export_rotation_is_retained(self):
         rotated = self.output("-rotated.mov")
         subprocess.run([media.FFMPEG, "-v", "error", "-display_rotation:v:0", "90", "-i", str(self.source), "-map", "0", "-c", "copy",
                         str(rotated)], check=True)
         before = media.inspect_media(rotated)
         self.assertEqual(before["rotation"], 90)
         output = self.output("-rotated-result.mov")
-        media.export_video(rotated, output, {"amount": 0.2})
+        self.export_cpu(rotated, output, {"amount": 0.2})
         after = media.inspect_media(output)
         self.assertEqual((after["rotation"], after["width"], after["height"]), (90, 320, 180))
 
-    @unittest.skipUnless(os.environ.get("STUDIO_GPU_TESTS") == "1", "Set STUDIO_GPU_TESTS=1 for CUDA round trips")
-    def test_gpu_hdr10_transfer_primaries_matrix_depth_retained(self):
+    def test_export_hdr10_transfer_primaries_matrix_depth_retained(self):
         import av
         import numpy as np
         source = self.output("-hdr.mov")
@@ -219,37 +292,75 @@ class RealMedia(unittest.TestCase):
             for packet in stream.encode():
                 container.mux(packet)
         output = self.output("-hdr-result.mov")
-        media.export_video(source, output, {"amount": 0.2})
+        self.export_cpu(source, output, {"amount": 0.2})
         video = media._video(media._probe(output))
         self.assertEqual((video["color_transfer"], video["color_primaries"], video["color_space"]),
                          ("smpte2084", "bt2020", "bt2020nc"))
         self.assertEqual(media.inspect_media(output)["bit_depth"], 10)
 
-    @unittest.skipUnless(os.environ.get("STUDIO_GPU_TESTS") == "1", "Set STUDIO_GPU_TESTS=1 for CUDA round trips")
-    def test_gpu_match_two_audio_tracks_and_source_unchanged(self):
+    def test_export_match_two_audio_tracks_and_source_unchanged(self):
         output = self.output(".mov")
-        result = media.export_video(self.source, output, {"amount": 0}, mode="match")
+        result = self.export_cpu(self.source, output, {"amount": 0}, mode="match")
         self.assertEqual(result["frames"], 6)
         self.assertEqual(result["audio"], "packet copy verified")
         self.assertEqual(result["encode_quality"], "lossless codec")
+        self.assertEqual(result["backend"]["device"], "cpu")
+        self.assertEqual(result["encoder"], "libx264")
         self.assertEqual(media._audio_hashes(output), media._audio_hashes(self.source))
         self.assertEqual(hashlib.sha256(self.source.read_bytes()).hexdigest(), self.source_hash)
 
-    @unittest.skipUnless(os.environ.get("STUDIO_GPU_TESTS") == "1", "Set STUDIO_GPU_TESTS=1 for CUDA round trips")
-    def test_gpu_rgb16_lossless_verifies_every_processed_sample(self):
-        result = media.export_video(self.source, self.output(".mkv"), {"amount": 0.3}, mode="lossless")
+    def test_export_rgb16_lossless_verifies_every_processed_sample(self):
+        result = self.export_cpu(self.source, self.output(".mkv"), {"amount": 0.3}, mode="lossless")
         self.assertEqual((result["pixel_format"], result["bit_depth"]), ("gbrp16le", 16))
         self.assertEqual(result["encode_quality"], "lossless RGB16")
 
-    @unittest.skipUnless(os.environ.get("STUDIO_GPU_TESTS") == "1", "Set STUDIO_GPU_TESTS=1 for CUDA round trips")
-    def test_gpu_hevc_conversion_reports_audio_conversion(self):
-        result = media.export_video(self.source, self.output(".mp4"), {"amount": 0}, mode="hevc")
+    def test_export_hevc_conversion_reports_audio_conversion(self):
+        result = self.export_cpu(self.source, self.output(".mp4"), {"amount": 0}, mode="hevc")
         self.assertEqual(result["audio_streams"], 2)
         self.assertEqual(result["audio"], "AAC")
         self.assertTrue(any("AAC" in message for message in result["warnings"]))
 
-    @unittest.skipUnless(os.environ.get("STUDIO_GPU_TESTS") == "1", "Set STUDIO_GPU_TESTS=1 for CUDA round trips")
-    def test_gpu_vfr_keeps_presentation_times(self):
+    @unittest.skipUnless(sys.platform == "darwin", "Actual VideoToolbox integration requires macOS")
+    def test_actual_mac_videotoolbox_hevc_8_and_10bit(self):
+        """Exercise real VT only when this PyAV build and Mac can encode it."""
+        import av
+        from fractions import Fraction
+        original_info = media.inspect_media(self.source)
+        plans = {}
+        for bits in (8, 10):
+            info = {**original_info, "bit_depth": bits,
+                    "pixel_format": "yuv420p10le" if bits == 10 else "yuv420p"}
+            plans[bits] = media._encoder_plan(info, "hevc", device_type="cpu")
+        if not any(plan["encoder"] == "hevc_videotoolbox" for plan in plans.values()):
+            self.skipTest("Installed PyAV/macOS hardware cannot provide HEVC VideoToolbox at 320x180 in either 8 or 10 bit")
+        for bits in (8, 10):
+            with self.subTest(bit_depth=bits):
+                if plans[bits]["encoder"] != "hevc_videotoolbox":
+                    self.skipTest(f"HEVC VideoToolbox {bits}-bit hardware session is unavailable")
+                source = self.source
+                if bits == 10:
+                    source = self.output("-vt-source-10bit.mov")
+                    subprocess.run([media.FFMPEG, "-v", "error", "-n", "-i", str(self.source),
+                                    "-map", "0", "-c:v", "libx265", "-pix_fmt", "yuv420p10le",
+                                    "-x265-params", "log-level=error:pools=2", "-c:a", "copy", str(source)], check=True)
+                before_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+                output = self.output(f"-vt-{bits}bit.mp4")
+                # Deliberately bypass export_cpu: effects stay on CPU through
+                # STUDIO_DEVICE, but delivery must select real Apple hardware.
+                result = media.export_video(source, output, {"amount": 0.2}, mode="hevc")
+                self.assertEqual(result["encoder"], "hevc_videotoolbox")
+                self.assertEqual(result["backend"]["device"], "cpu")
+                self.assertEqual((result["width"], result["height"], result["frames"], result["bit_depth"]),
+                                 (320, 180, 6, bits))
+                self.assertEqual(result["audio_streams"], 2)
+                self.assertEqual(media.inspect_media(output)["codec"], "hevc")
+                def decoded_times(path):
+                    with av.open(str(path)) as container:
+                        return [Fraction(frame.pts) * frame.time_base for frame in container.decode(video=0)]
+                self.assertEqual(decoded_times(source), decoded_times(output))
+                self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), before_hash)
+
+    def test_export_vfr_keeps_presentation_times(self):
         import av
         import numpy as np
         from fractions import Fraction
@@ -267,7 +378,7 @@ class RealMedia(unittest.TestCase):
             for packet in stream.encode():
                 container.mux(packet)
         output = self.output("-vfr-output.mov")
-        result = media.export_video(source, output, {"amount": 0}, mode="match")
+        result = self.export_cpu(source, output, {"amount": 0}, mode="match")
         def times(path):
             with av.open(str(path)) as container:
                 return [Fraction(f.pts) * f.time_base for f in container.decode(video=0)]

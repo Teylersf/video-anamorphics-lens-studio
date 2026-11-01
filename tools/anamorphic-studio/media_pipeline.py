@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 from pathlib import Path
 import shutil
 import signal
@@ -201,9 +202,52 @@ def _pixel_signature(pixel):
             fmt.chroma_width(128), fmt.chroma_height(128), len(fmt.components))
 
 
-def _encoder_plan(info, mode, force_cpu=False):
+def _hardware_works(encoder, pixel, info, options):
+    """Probe the installed PyAV encoder and actual geometry, not a codec label.
+
+    Probe packets are discarded. This runs inside the owned export worker, so
+    cancellation/deadline also bounds a blocked native hardware probe.
+    """
+    import av
+    if encoder not in av.codecs_available:
+        return False
+    try:
+        context = av.CodecContext.create(encoder, "w")
+        formats = {f.name for f in context.codec.video_formats or []}
+        if formats and pixel not in formats:
+            return False
+        context.width, context.height, context.pix_fmt = info["width"], info["height"], pixel
+        rate = _fraction(info.get("fps_exact", "30")) or Fraction(30)
+        context.time_base, context.framerate = 1 / rate, rate
+        context.max_b_frames = 0
+        if encoder.endswith("_videotoolbox"):
+            context.flags = int(context.flags) & ~int(av.codec.context.Flags.qscale)
+        context.options = dict(options)
+        context.open()
+        if encoder.endswith("_videotoolbox") and ("global_quality" in context.options or
+                int(context.flags) & int(av.codec.context.Flags.qscale)):
+            return False
+        frame = av.VideoFrame(info["width"], info["height"], pixel)
+        for plane in frame.planes:
+            plane.update(bytes(plane.buffer_size))
+        frame.pts, frame.time_base = 0, 1 / rate
+        packets = list(context.encode(frame)) + list(context.encode())
+        return bool(packets)
+    except (ValueError, RuntimeError, av.error.FFmpegError):
+        return False
+
+
+def _encoder_formats(encoder):
+    import av
+    return {f.name for f in av.CodecContext.create(encoder, "w").codec.video_formats or []}
+
+
+def _encoder_plan(info, mode, force_cpu=False, device_type=None):
     """Choose exact format or fail; match never silently changes the codec."""
     import av
+    if device_type is None:
+        from runtime_backend import select_device
+        device_type = select_device().type
     source_codec, pixel = info["codec"], info["pixel_format"]
     if _pixel_signature(pixel)[-1] == 4 and mode == "match":
         raise ValueError("Match-source alpha-channel processing is not supported; use a non-alpha export mode explicitly")
@@ -225,18 +269,40 @@ def _encoder_plan(info, mode, force_cpu=False):
     encoder = mapping[codec]
     options, quality = {}, "highest quality"
     width, height = info["width"], info["height"]
-    nv_ok = not force_cpu and width % 2 == height % 2 == 0 and width >= 144 and height >= 128
+    nv_ok = not force_cpu and device_type == "cuda" and width % 2 == height % 2 == 0 and width >= 144 and height >= 128
     nv_pixel = {"yuv420p": "yuv420p", "yuv420p10le": "p010le", "yuv444p": "yuv444p", "yuv444p10le": "yuv444p16le"}.get(pixel)
+    hardware_encoder, hardware_pixel, hardware_options = None, None, None
+    plan_warnings = []
     if codec in ("h264", "hevc") and nv_ok and nv_pixel and max(width, height) <= (4096 if codec == "h264" else 8192) and not (codec == "h264" and info["bit_depth"] > 8):
-        encoder, pixel = codec + "_nvenc", nv_pixel
         if mode == "match":
-            options, quality = {"preset": "p3", "tune": "lossless", "rc": "constqp", "qp": "0"}, "lossless codec"
+            hardware_options = {"preset": "p3", "tune": "lossless", "rc": "constqp", "qp": "0"}
         else:
-            options = {"preset": "p5", "rc": "vbr", "cq": "16", "b": "0"}
+            hardware_options = {"preset": "p5", "rc": "vbr", "cq": "16", "b": "0"}
+        if _hardware_works(codec + "_nvenc", nv_pixel, info, hardware_options):
+            hardware_encoder, hardware_pixel = codec + "_nvenc", nv_pixel
+        else:
+            plan_warnings.append("NVENC is unavailable for this format or geometry; a software encoder is used.")
+    # VideoToolbox does not promise a lossless H.264/HEVC encode. Match uses
+    # software lossless even when Apple hardware supports the source format.
+    elif platform.system() == "Darwin" and not force_cpu and mode in ("hevc", "preview") and codec in ("h264", "hevc") and width % 2 == height % 2 == 0:
+        vt_pixel = {"yuv420p": "nv12", "yuv420p10le": "p010le"}.get(pixel)
+        if vt_pixel and not (codec == "h264" and pixel != "yuv420p"):
+            # FFmpeg maps global_quality / 100 to VT Quality. No realtime speed
+            # hint and no silent VT software session: our explicit fallback is
+            # separately selected and reported below.
+            hardware_options = {"allow_sw": "0", "realtime": "0", "global_quality": "75", "b": "0"}
+            if _hardware_works(codec + "_videotoolbox", vt_pixel, info, hardware_options):
+                hardware_encoder, hardware_pixel = codec + "_videotoolbox", vt_pixel
+            else:
+                plan_warnings.append("VideoToolbox is unavailable for this format or geometry; a software encoder is used.")
+    if hardware_encoder:
+        encoder, pixel, options = hardware_encoder, hardware_pixel, hardware_options
+        quality = "lossless codec" if mode == "match" else "highest quality"
     elif codec in ("h264", "hevc"):
-        options, quality = {"preset": "medium", "crf": "0"}, "lossless codec"
+        lossless = mode == "match"
+        options, quality = {"preset": "medium", "crf": "0" if lossless else "16"}, "lossless codec" if lossless else "highest quality"
         if codec == "hevc":
-            options = {"preset": "medium", "x265-params": "lossless=1:log-level=error"}
+            options = {"preset": "medium", "x265-params": "log-level=error:pools=4:frame-threads=2" + (":lossless=1" if lossless else ""), **({} if lossless else {"crf": "16"})}
     elif codec == "ffv1":
         options, quality = {"level": "3"}, "lossless codec"
     elif codec == "vp9":
@@ -253,10 +319,10 @@ def _encoder_plan(info, mode, force_cpu=False):
         options = {"profile": "dnxhr_hqx" if "10" in pixel else "dnxhr_hq"}
     if encoder not in av.codecs_available:
         raise ValueError(f"Installed PyAV does not provide {encoder}")
-    formats = {f.name for f in av.CodecContext.create(encoder, "w").codec.video_formats or []}
+    formats = _encoder_formats(encoder)
     if pixel not in formats and formats:
         raise ValueError(f"{encoder} cannot preserve source pixel format {pixel}; choose an explicit conversion mode")
-    return {"encoder": encoder, "codec": codec, "pixel": pixel, "options": options, "quality": quality}
+    return {"encoder": encoder, "codec": codec, "pixel": pixel, "options": options, "quality": quality, "warnings": plan_warnings}
 
 
 def _active_bytes(frame):
@@ -312,9 +378,15 @@ def _stop_tree(proc):
             proc.kill()
     else:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            # Only a worker created with start_new_session owns a process group
+            # named by its PID. Ordinary ffprobe children share our group and
+            # must be killed individually, never by their inherited PGID.
+            if os.getpgid(proc.pid) == proc.pid:
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
         except ProcessLookupError:
-            proc.kill()
+            pass
     try:
         proc.wait(timeout=15)
     except subprocess.TimeoutExpired:
@@ -395,10 +467,10 @@ def _worker(request):
     import numpy as np
     import torch
     from studio_engine import StudioRenderer, to_display_rgb
+    from runtime_backend import select_device, backend_info
     global FFMPEG, FFPROBE
     FFMPEG, FFPROBE = request["ffmpeg"], request["ffprobe"]
-    if not torch.cuda.is_available():
-        raise ValueError("A working CUDA-enabled PyTorch GPU is required")
+    device = select_device()
     source, work, mode = Path(request["source"]), Path(request["work"]), request["mode"]
     info, metadata = inspect_media(source), _probe(source)
     video = _video(metadata)
@@ -408,7 +480,8 @@ def _worker(request):
         ratio = min(1.0, 1280 / max(info["width"], info["height"]))
         info["width"] = max(2, 2 * int(info["width"] * ratio / 2))
         info["height"] = max(2, 2 * int(info["height"] * ratio / 2))
-    plan = _encoder_plan(info, mode, bool(request["settings"].get("_force_cpu_encoder", False)))
+    plan = _encoder_plan(info, mode, bool(request["settings"].get("_force_cpu_encoder", False)), device.type)
+    warnings.extend(plan.get("warnings", []))
     renderer = StudioRenderer({k: v for k, v in request["settings"].items() if not k.startswith("_")}, transfer=info["transfer"])
     rate = Fraction(info["fps_exact"])
     temporary = work / "rendered.nut"
@@ -427,6 +500,8 @@ def _worker(request):
         output_stream.width, output_stream.height = info["width"], info["height"]
         output_stream.pix_fmt, output_stream.options = plan["pixel"], plan["options"]
         output_stream.codec_context.max_b_frames = 0
+        if plan["encoder"].endswith("_videotoolbox"):
+            output_stream.codec_context.flags = int(output_stream.codec_context.flags) & ~int(av.codec.context.Flags.qscale)
         output_stream.codec_context.sample_aspect_ratio = Fraction(info["sample_aspect_ratio"])
         for attr in ("color_range", "color_trc", "color_primaries", "colorspace"):
             setattr(output_stream.codec_context, attr, getattr(stream.codec_context, attr))
@@ -458,7 +533,7 @@ def _worker(request):
                     format="rgb48le", src_colorspace=matrix,
                     src_color_range=source_range, dst_color_range=2)
                 rgb = rgb_frame.to_ndarray()
-                tensor = torch.from_numpy(rgb.astype(np.float32)).to("cuda").permute(2, 0, 1) / 65535.0
+                tensor = torch.from_numpy(rgb.astype(np.float32)).to(device).permute(2, 0, 1) / 65535.0
                 turns = info["rotation"] // 90
                 if turns:
                     tensor = torch.rot90(tensor, turns, (1, 2))
@@ -528,6 +603,9 @@ def _worker(request):
         raise ValueError("Encoded geometry or codec differs from the requested result")
     if mode == "match" and _pixel_signature(saved["pix_fmt"]) != _pixel_signature(info["pixel_format"]):
         raise ValueError("Match-source export changed source bit depth/chroma")
+    if mode in ("hevc", "preview") and _pixel_signature(saved["pix_fmt"])[:4] != (
+            10 if mode == "hevc" and info["bit_depth"] > 8 else 8, False, 64, 64):
+        raise ValueError("Delivery export changed the requested bit depth/chroma")
     if mode not in ("lossless", "preview"):
         for field in ("color_range", "color_space", "color_transfer", "color_primaries"):
             if video.get(field) not in (None, "unknown", "unspecified") and saved.get(field) != video[field]:
@@ -570,7 +648,8 @@ def _worker(request):
               "timestamps": "source presentation timestamps retained", "codec": plan["codec"], "encoder": plan["encoder"],
               "pixel_format": saved["pix_fmt"], "bit_depth": _depth(saved["pix_fmt"]), "container": request["suffix"].lstrip("."),
               "audio_streams": len(audio), "audio": "packet copy verified" if audio_copy else ("AAC" if audio else "none"),
-              "encode_quality": plan["quality"], "transfer": info["transfer"], "warnings": warnings}
+              "encode_quality": plan["quality"], "transfer": info["transfer"], "warnings": warnings,
+              "backend": backend_info(device)}
     (work / "result.json").write_text(json.dumps(result), encoding="utf-8")
 
 

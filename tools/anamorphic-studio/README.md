@@ -1,7 +1,9 @@
-# Anamorphic Studio — local GPU app
+# Anamorphic Studio — local CUDA / Metal / CPU app
 
-Double-click **START ANAMORPHIC STUDIO.cmd** in the repository root, then use
-**http://127.0.0.1:8766**. **STOP ANAMORPHIC STUDIO.cmd** stops this service and
+On Windows, double-click **START ANAMORPHIC STUDIO.cmd** in the repository
+root. On Apple Silicon Mac, first follow [the Mac setup guide](../../docs/MACOS.md),
+then open **START ANAMORPHIC STUDIO.command**. Use **http://127.0.0.1:8766**.
+The corresponding **STOP ANAMORPHIC STUDIO.cmd / .command** stops this service and
 cancels its renders. No deployment is performed. Uploaded media, previews and
 exports stay in ignored `out/anamorphic-studio/` on this computer.
 
@@ -21,7 +23,9 @@ the result before publishing a new filename. Audio packet payload hashes and
 their timestamp extents are compared when audio is copied. Originals and
 existing output paths are never overwritten.
 
-H.264/HEVC use NVIDIA's verified lossless codec mode where supported. Other
+H.264/HEVC use NVIDIA's verified lossless codec mode where supported on CUDA.
+On Mac, Match source uses software libx264/libx265 lossless encoding rather
+than VideoToolbox. Other
 supported codecs use lossless encoding where available, or their highest
 practical quality setting. An unsupported exact match produces an explicit
 error instead of silently changing formats. **Lossless encoding of processed
@@ -32,7 +36,9 @@ information. Lossless files can be substantially larger than their sources.
 Other explicit export choices:
 
 - **HEVC / H.265:** efficient high-quality MP4. Incompatible source audio is
-  converted to AAC with a reported warning.
+  converted to AAC with a reported warning. On Mac, supported VideoToolbox
+  encoding is capability-probed; unavailable formats use a reported software
+  fallback. VideoToolbox delivery is not mathematically lossless.
 - **ProRes master:** high-quality editing MOV, not mathematically lossless.
 - **Lossless RGB master:** FFV1/MKV with 16-bit RGB samples. Every decoded
   processed sample is hash-verified. This is a larger editing/archive file,
@@ -44,12 +50,22 @@ video; the modified movie cannot be byte-identical to its original.
 
 ## Lens engine
 
-The original CUDA renderer includes relative linear-light, soft-knee highlight
+The CUDA, Metal/MPS and CPU renderer includes relative linear-light, soft-knee highlight
 selection; smooth normalized multiscale horizontal flare kernels; blue/amber
 coating color; chromatic dispersion; reflected lens ghosts; anisotropic bloom;
 warm halation; strip-sampled radial distortion and edge color separation;
 vignette; exposure/contrast/saturation; and deterministic animated grain.
 Controls scale with image dimensions, and no full-clip frame buffer is kept.
+
+The default `STUDIO_DEVICE=auto` selects an available CUDA device, then Metal
+MPS, then CPU. Set `STUDIO_DEVICE=cpu`, `mps` or `cuda` before launching to choose
+explicitly; an unavailable explicit accelerator fails rather than silently
+changing that choice. Rendering failures propagate instead of automatically
+moving a failed frame to another backend. On MPS, lens/color operations stay
+on Metal; deterministic integer grain noise is computed in bounded CPU tiles
+and transferred as floating noise. This is not a global unsupported-operation
+fallback. Floating results can differ slightly between backends; byte identity
+across CUDA, MPS and CPU is not promised.
 
 Oval bokeh/focus falloff is optional and uses a protected horizontal focus band.
 It is an artistic mask, **not estimated scene depth or a calibrated optical
@@ -67,7 +83,7 @@ Camera Log/RAW development and calibrated HDR mastering are separate work.
 
 ## Resolution, formats and local storage
 
-The tested processing envelope is **up to 8192 pixels per axis and 35.65 MP**,
+The CUDA-tested processing envelope is **up to 8192 pixels per axis and 35.65 MP**,
 including UHD 8K 7680×4320 and its portrait orientation. Export preserves the
 source resolution; processing a 1080p clip does not create captured 8K detail.
 Import accepts common MOV/MP4, Matroska/WebM, AVI, MXF, MPEG/TS, ASF and Ogg
@@ -83,6 +99,13 @@ serializes GPU jobs. Cancelling terminates only the owned export-worker tree;
 the two-hour default deadline also stops a stuck worker before publication.
 
 ## Setup / development
+
+For Apple Silicon, use [the Mac guide](../../docs/MACOS.md) and run
+`bash "SETUP MAC.command"` from the repository root. It verifies native ARM64
+Python 3.13 and installs the compatibility-pinned PyTorch 2.11.0 environment.
+Then run `bash "START ANAMORPHIC STUDIO.command"`. Setup does not start a
+persistent service. Metal/VideoToolbox throughput requires actual Mac testing;
+conditional tests and dependency checks alone do not establish it.
 
 The tested machine uses Windows, Python 3.13, PyTorch 2.11.0+cu126, RTX 3090
 24 GB, driver 621.01, PyAV 17.0.0, system FFmpeg 7.0.2 and Node 22.19.0.
@@ -116,6 +139,11 @@ $env:STUDIO_GPU_TESTS = '1'
 ```
 
 ## Verified end to end
+
+The physical rendering and large-format results in this section were obtained
+on the Windows/CUDA configuration above. CPU engine tests also run; Metal and
+VideoToolbox cases are conditional on actual backend availability and are not
+claimed as hardware-verified by these Windows results.
 
 - The owner's complete 349-frame T6 clip exported as 1920×1080 MOV/H.264 at
   exact 30000/1001 timing, original 8-bit 4:2:0/full range and verified PCM packet

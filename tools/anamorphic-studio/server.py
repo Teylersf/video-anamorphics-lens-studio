@@ -35,7 +35,7 @@ MEDIA: dict[str, dict] = {}
 JOBS: dict[str, dict] = {}
 CANCEL: dict[str, threading.Event] = {}
 SERVER = None
-VERSION = '0.2.0-local'
+VERSION = '0.3.0-local'
 MAX_UPLOAD = 64 * 1024**3
 EXTENSIONS = {'.mp4', '.mov', '.mkv', '.webm', '.avi', '.mxf', '.m4v', '.mts', '.m2ts', '.mpg', '.mpeg', '.ts', '.m2v', '.wmv', '.flv', '.ogv'}
 
@@ -142,11 +142,18 @@ async def local_mutations(request: Request, call_next):
 
 @app.get('/api/status')
 def status():
-    import torch
-    ready = torch.cuda.is_available() and bool(shutil.which('ffmpeg')) and bool(shutil.which('ffprobe'))
-    return {'app': 'Anamorphic Studio', 'version': VERSION, 'ready': ready,
-            'gpu': torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CUDA unavailable',
-            'ffmpeg': bool(shutil.which('ffmpeg')), 'local_only': True, 'gpu_busy': GPU_LOCK.locked()}
+    ffmpeg, ffprobe = bool(shutil.which('ffmpeg')), bool(shutil.which('ffprobe'))
+    try:
+        from runtime_backend import backend_info
+        backend = backend_info()
+        ready = ffmpeg and ffprobe
+        if not ready:
+            backend['reason'] = 'Install FFmpeg and ffprobe, then restart Studio.'
+    except (ImportError, RuntimeError, ValueError, TypeError) as error:
+        backend = {'device': None, 'gpu': 'Renderer unavailable', 'accelerated': False, 'reason': str(error)}
+        ready = False
+    return {'app': 'Anamorphic Studio', 'version': VERSION, 'ready': ready, **backend,
+            'ffmpeg': ffmpeg, 'ffprobe': ffprobe, 'local_only': True, 'gpu_busy': GPU_LOCK.locked()}
 
 
 @app.get('/api/config')
@@ -260,6 +267,7 @@ def preview(request: PreviewRequest):
     from PIL import Image
     import torch
     import torch.nn.functional as F
+    from runtime_backend import select_device, backend_info, empty_cache
     media = get_media(request.media_id)
     if not math.isfinite(request.time):
         raise HTTPException(422, 'Invalid preview position')
@@ -273,16 +281,26 @@ def preview(request: PreviewRequest):
     if before.exists() and after.exists() and info_path.exists():
         return json.loads(info_path.read_text())
     if not GPU_LOCK.acquire(blocking=False):
-        raise HTTPException(409, 'The GPU is rendering an export. Existing previews remain available.')
+        raise HTTPException(409, 'The renderer is processing an export. Existing previews remain available.')
     started = time.perf_counter()
+    device = None
     try:
+        device = select_device()
         array, actual_time = frame_at(source_path(media), position, media)
         height, width = array.shape[:2]
-        tensor = torch.from_numpy(array.astype(np.float32)).to('cuda').permute(2, 0, 1) / 65535
+        # MPS does not implement antialiased bilinear downsampling. Resize the
+        # display preview on CPU before upload; the full-resolution export stays
+        # on its selected rendering device.
+        tensor = torch.from_numpy(array.astype(np.float32))
+        if device.type != 'mps':
+            tensor = tensor.to(device)
+        tensor = tensor.permute(2, 0, 1) / 65535
         scale = min(1, request.width / width, 1080 / height)
         if scale < 1:
             tensor = F.interpolate(tensor[None], size=(max(1, round(height * scale)), max(1, round(width * scale))),
                                    mode='bilinear', align_corners=False, antialias=True)[0]
+        if device.type == 'mps':
+            tensor = tensor.to(device)
         transfer = str(media.get('transfer') or 'bt709')
         rendered = engine().StudioRenderer(settings, transfer=transfer).render(
             tensor, frame_index=round(actual_time * float(media['fps'])), time_s=actual_time)
@@ -295,6 +313,7 @@ def preview(request: PreviewRequest):
                 'processed_url': f'/api/frames/{media["id"]}/{after.name}', 'time': actual_time,
                 'width': int(rendered.shape[2]), 'height': int(rendered.shape[1]),
                 'render_ms': round((time.perf_counter() - started) * 1000),
+                'backend': backend_info(device),
                 'hdr_display_preview': transfer in ('pq', 'hlg', 'smpte2084', 'arib-std-b67')}
         save_json(info_path, info)
         del rendered, tensor
@@ -302,8 +321,11 @@ def preview(request: PreviewRequest):
     except Exception as error:
         raise HTTPException(422, str(error)) from error
     finally:
-        torch.cuda.empty_cache()
-        GPU_LOCK.release()
+        try:
+            if device is not None:
+                empty_cache(device)
+        finally:
+            GPU_LOCK.release()
 
 
 @app.get('/api/frames/{identifier}/{name}')
@@ -368,7 +390,7 @@ def start_job(request: JobRequest):
         folder = STORE / 'jobs' / identifier
         folder.mkdir(parents=True)
         job = {'id': identifier, 'media_id': media['id'], 'status': 'queued', 'progress': 0,
-               'message': 'Queued for the local GPU', 'output_url': None, 'output_name': None,
+               'message': 'Queued for the local renderer', 'output_url': None, 'output_name': None,
                'error': None, 'preview': request.preview, 'mode': request.mode, 'created_at': time.time()}
         JOBS[identifier] = job
         CANCEL[identifier] = threading.Event()
