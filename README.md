@@ -9,6 +9,36 @@ export at the original resolution—tested through **7680×4320, 10-bit HDR**.
 **Local processing. Original files preserved. Match-source export by default.**
 No camera firmware, cloud account or Vercel deployment is required.
 
+## Before / after — extreme settings
+
+**Same source. Actual CUDA renderer. Deliberately stronger than the default.**
+
+![Before and after: real neon-street photograph processed with Extreme Blue anamorphic settings](docs/images/extreme-blue-before-after.jpg)
+
+This showcase uses **100% overall intensity, 200% flare intensity and a 45%
+highlight threshold**, with strong bloom, halation, ghosts and edge color
+separation. Exposure stays unchanged. The left panel is the source photograph;
+the right panel is the actual output of the app's `StudioRenderer`.
+
+<details>
+<summary><strong>See Extreme Amber + focus falloff</strong></summary>
+
+![Before and after: the same photograph with Extreme Amber, strong halation and focus falloff](docs/images/extreme-amber-before-after.jpg)
+
+The amber variant adds warm flares, stronger halation and optional focus
+falloff. Its blur uses the app's protected horizontal focus band, not estimated
+scene depth.
+
+</details>
+
+**Try these settings:** save [Extreme Blue](examples/looks/extreme-blue.json) or
+[Extreme Amber](examples/looks/extreme-amber.json) as a JSON file, then choose
+**Load look** in the app. These showcase looks do not change the normal defaults.
+
+Photo: [Wilfredor, *Hong Kong night street 2*](https://commons.wikimedia.org/wiki/File:Hong_Kong_night_street_2.jpg),
+[CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
+[Image credits, exact settings and reproduction](docs/images/README.md).
+
 ## What it does
 
 - Four starting profiles: **Modern, Vintage, Clean and Bypass**.
@@ -103,5 +133,5 @@ approved GPU backend, without relaying video through Vercel.
 
 Application source is **GPL-2.0-only**; see [LICENSE](LICENSE) and
 [provenance / dependency notices](NOTICE.md). Third-party dependencies retain
-their respective licenses. Footage, exports, camera ROMs and local environments
+their respective licenses. User footage, local exports, camera ROMs and environments
 are not part of this repository.

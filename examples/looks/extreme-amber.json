@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "app": "anamorphic-studio",
+  "name": "Extreme Amber — README demonstration",
+  "settings": {
+    "amount": 1,
+    "flare": 2,
+    "flare_length": 0.22,
+    "threshold": 0.45,
+    "tint": 1,
+    "bloom": 0.7,
+    "halation": 0.75,
+    "ghosts": 0.5,
+    "chromatic": 0.65,
+    "distortion": 0.22,
+    "vignette": 0.45,
+    "grain": 0.18,
+    "bokeh": 0.65,
+    "ovality": 2.5,
+    "focus_y": 0.8,
+    "focus_width": 0.4,
+    "exposure": 0,
+    "contrast": 1.08,
+    "saturation": 1.12
+  }
+}

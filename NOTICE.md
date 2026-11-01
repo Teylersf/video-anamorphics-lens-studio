@@ -12,6 +12,11 @@ text in LICENSE. The engine's comments identify its numerical color-science
 references; primary-coordinate and matrix calculations are independently
 tested. The UI uses system fonts and an original SVG mark.
 
+The README comparisons use Wilfredor's CC0 photograph, rendered by the actual
+application. See the [image credits and reproduction notes](docs/images/README.md)
+for the original source, license and processing details. These small public
+documentation examples are separate from users' private footage and exports.
+
 Dependencies are installed separately rather than vendored. Their own licenses
 apply, including React/React DOM, Vite, TypeScript, Lucide, PyTorch, NumPy,
 Pillow, PyAV, FastAPI, Uvicorn and their transitive dependencies. FFmpeg and its

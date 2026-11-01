@@ -1,0 +1,90 @@
+{
+  "source_page": "https://commons.wikimedia.org/wiki/File:Hong_Kong_night_street_2.jpg",
+  "source_author": "Wilfredor",
+  "source_license": "CC0-1.0",
+  "source_sha256": "d242cf64cf244bcd9b4bba96d7f8b8249d726260eee8e67997203a0a7babbe2e",
+  "original_dimensions": [
+    2848,
+    2483
+  ],
+  "render_dimensions": [
+    1280,
+    1116
+  ],
+  "transfer": "srgb",
+  "frame_index": 0,
+  "renderer_sha256": "6b47eab6e10ea33643463e93bd8aa17b66be58bde5694c32b172be255b31c6eb",
+  "torch_version": "2.11.0+cu126",
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "renders": {
+    "blue": {
+      "preset": "examples/looks/extreme-blue.json",
+      "image": "extreme-blue-before-after.jpg",
+      "image_sha256": "5f59d8e6415ee5186c52dfb9cf164441dc90371ceb4edfb4fa7de6ad805152dc",
+      "image_bytes": 466704,
+      "image_dimensions": [
+        1600,
+        838
+      ],
+      "processed_rgb_sha256": "4e5abb00773551cddf92b012efb51978c19e9547af10a4187fe73b429f645650",
+      "mean_absolute_rgb_difference": 0.153991,
+      "fraction_pixels_changed_over_3_percent": 0.944314,
+      "settings": {
+        "amount": 1.0,
+        "flare": 2.0,
+        "flare_length": 0.2,
+        "threshold": 0.45,
+        "tint": 0.05,
+        "bloom": 0.65,
+        "halation": 0.55,
+        "ghosts": 0.4,
+        "chromatic": 0.65,
+        "distortion": 0.18,
+        "vignette": 0.4,
+        "grain": 0.12,
+        "bokeh": 0.0,
+        "ovality": 2.5,
+        "focus_y": 0.55,
+        "focus_width": 0.35,
+        "exposure": 0.0,
+        "contrast": 1.08,
+        "saturation": 1.15
+      }
+    },
+    "amber": {
+      "preset": "examples/looks/extreme-amber.json",
+      "image": "extreme-amber-before-after.jpg",
+      "image_sha256": "e486e9f7b40c8399824daff6dc9ec22ee3939a74e946a73935a596647e9c0120",
+      "image_bytes": 445925,
+      "image_dimensions": [
+        1600,
+        838
+      ],
+      "processed_rgb_sha256": "56c6a6494b236dd0d03f336fbf70c53d6647e3e1656bda2ef3f6740989e67e8e",
+      "mean_absolute_rgb_difference": 0.165667,
+      "fraction_pixels_changed_over_3_percent": 0.975238,
+      "settings": {
+        "amount": 1.0,
+        "flare": 2.0,
+        "flare_length": 0.22,
+        "threshold": 0.45,
+        "tint": 1.0,
+        "bloom": 0.7,
+        "halation": 0.75,
+        "ghosts": 0.5,
+        "chromatic": 0.65,
+        "distortion": 0.22,
+        "vignette": 0.45,
+        "grain": 0.18,
+        "bokeh": 0.65,
+        "ovality": 2.5,
+        "focus_y": 0.8,
+        "focus_width": 0.4,
+        "exposure": 0.0,
+        "contrast": 1.08,
+        "saturation": 1.12
+      }
+    }
+  },
+  "source_file_and_tensor_unchanged": true
+}
