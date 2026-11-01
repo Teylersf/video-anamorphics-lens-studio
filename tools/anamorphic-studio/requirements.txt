@@ -1,0 +1,9 @@
+# Install CUDA-enabled PyTorch separately using pytorch.org for the target GPU.
+# The local project venv can reuse an existing CUDA install with --system-site-packages.
+fastapi==0.139.0
+uvicorn==0.40.0
+python-multipart==0.0.22
+httpx==0.28.1
+av==17.0.0
+numpy>=2.2,<3
+Pillow>=11.3,<13

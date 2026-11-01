@@ -1,0 +1,33 @@
+# Local source media, proxies, renders and logs
+out/
+test-output/
+*.log
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.mxf
+*.mts
+*.m2ts
+*.cr2
+*.fir
+*.bin
+rom/
+
+# Dependencies and generated builds
+node_modules/
+dist/
+build/
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+*.tsbuildinfo
+
+# Local configuration
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

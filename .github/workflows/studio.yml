@@ -1,0 +1,35 @@
+name: Anamorphic Studio checks
+on:
+  push:
+    paths: ['app/**', 'tools/anamorphic-studio/**', '.github/workflows/studio.yml']
+  pull_request:
+    paths: ['app/**', 'tools/anamorphic-studio/**', '.github/workflows/studio.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  client:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+        working-directory: app
+      - run: npm run build
+        working-directory: app
+      - run: npm run lint
+        working-directory: app
+  media-contracts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: python -m pip install av==17.0.0 numpy Pillow
+      - run: python tools/anamorphic-studio/test_media_pipeline.py
