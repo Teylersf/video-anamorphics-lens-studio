@@ -274,7 +274,10 @@ class CpuTests(unittest.TestCase):
     def test_validation(self):
         renderer = StudioRenderer({})
         valid = torch.zeros((3, 9, 11), device=self.device)
-        for frame in (torch.empty((3, 9, 11), device="meta"), valid.double(), torch.zeros((2, 9, 11), device=self.device),
+        # MPS cannot construct float64 at all; float16 still exercises our
+        # float32-only contract without failing in the test fixture first.
+        wrong_dtype = valid.half() if self.device == "mps" else valid.double()
+        for frame in (torch.empty((3, 9, 11), device="meta"), wrong_dtype, torch.zeros((2, 9, 11), device=self.device),
                       torch.empty((3, 0, 11), device=self.device)):
             with self.assertRaises((TypeError, ValueError)):
                 renderer(frame)
