@@ -157,6 +157,17 @@ def _new_output(path):
     return path
 
 
+def _require_hdr_proxy_filters():
+    listing = _run([FFMPEG, "-hide_banner", "-filters"], 30).decode(errors="replace")
+    available = {parts[1] for line in listing.splitlines() if len(parts := line.split()) >= 3}
+    missing = sorted({"zscale", "tonemap"} - available)
+    if missing:
+        raise ValueError("HDR preview requires FFmpeg filters missing from this installation: " +
+                         ", ".join(missing) + ". On Mac, run brew install ffmpeg-full, then rerun SETUP MAC.command; "
+                         "otherwise install a full FFmpeg build with zscale/libzimg and tonemap. "
+                         "Set STUDIO_FFMPEG to that build's executable and restart Studio.")
+
+
 def make_proxy(source, outmp4, posterjpg):
     """Checked, browser-safe SDR H.264/AAC proxy; never changes the source."""
     source = _regular(source)
@@ -165,24 +176,34 @@ def make_proxy(source, outmp4, posterjpg):
     output, poster = _new_output(outmp4), _new_output(posterjpg)
     if output == poster:
         raise ValueError("Proxy and poster paths must differ")
+    hdr = info["transfer"] in ("pq", "hlg")
+    if hdr:
+        _require_hdr_proxy_filters()
     with tempfile.TemporaryDirectory(prefix=".studio-proxy-", dir=output.parent) as folder:
         temporary = Path(folder)
         proxy, jpg = temporary / "proxy.mp4", temporary / "poster.jpg"
         filters = []
-        if info["transfer"] in ("pq", "hlg"):
+        if hdr:
             filters += ["zscale=t=linear:npl=100", "format=gbrpf32le", "tonemap=tonemap=mobius:desat=0",
                         "zscale=p=bt709:t=bt709:m=bt709:r=tv"]
         filters += ["scale=w='min(1280,2*trunc(iw*sar/2))':h='max(2,2*trunc(ow/dar/2))':flags=lanczos",
                     "setsar=1", "format=yuv420p"]
+        color_options = []
+        if hdr:
+            filters += ["setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709"]
+            color_options = ["-color_range", "tv", "-colorspace", "bt709", "-color_trc", "bt709", "-color_primaries", "bt709"]
         _run([FFMPEG, "-hide_banner", "-v", "error", "-xerror", "-n", *_PROTOCOLS,
               "-i", str(source), "-map", f"0:{selected_video}", "-map", "0:a:0?", "-vf", ",".join(filters),
               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "160k",
-              "-movflags", "+faststart", str(proxy)], 7200)
+              *color_options, "-movflags", "+faststart", str(proxy)], 7200)
         _run([FFMPEG, "-v", "error", "-xerror", "-n", *_PROTOCOLS, "-i", str(proxy),
               "-frames:v", "1", "-update", "1", str(jpg)], 120)
         saved = _video(_probe(proxy))
         if saved["codec_name"] != "h264" or int(saved["width"]) > 1280 or not jpg.stat().st_size:
             raise ValueError("Proxy verification failed")
+        if hdr and tuple(saved.get(key) for key in ("color_primaries", "color_transfer", "color_space", "color_range")) != (
+                "bt709", "bt709", "bt709", "tv"):
+            raise ValueError("HDR preview did not encode the required SDR BT.709 color tags")
         _run([FFMPEG, "-v", "error", "-xerror", *_PROTOCOLS, "-i", str(proxy),
               "-f", "null", "-"], 7200)
         _publish(proxy, output)

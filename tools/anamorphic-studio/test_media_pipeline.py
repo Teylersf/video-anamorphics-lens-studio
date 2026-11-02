@@ -290,11 +290,11 @@ class RealMedia(unittest.TestCase):
         after = media.inspect_media(output)
         self.assertEqual((after["rotation"], after["width"], after["height"]), (90, 320, 180))
 
-    def test_export_hdr10_transfer_primaries_matrix_depth_retained(self):
+    def hdr_fixture(self, transfer="pq"):
         import av
         import numpy as np
         from fractions import Fraction
-        source = self.output("-hdr.mov")
+        source = self.output(f"-{transfer}-hdr.mov")
         time_base = Fraction(1, 30)
         packet_times = []
         with av.open(str(source), "w") as container:
@@ -306,7 +306,7 @@ class RealMedia(unittest.TestCase):
             stream.time_base = stream.codec_context.time_base = time_base
             stream.codec_context.max_b_frames = 0
             stream.options = {"x265-params": "log-level=error:bframes=0"}
-            stream.codec_context.color_trc = 16
+            stream.codec_context.color_trc = 16 if transfer == "pq" else 18
             stream.codec_context.color_primaries = 9
             stream.codec_context.colorspace = 9
             stream.codec_context.color_range = 1
@@ -319,7 +319,7 @@ class RealMedia(unittest.TestCase):
                 packet_times.append(times)
                 container.mux(packet)
             for index in range(2):
-                frame = av.VideoFrame.from_ndarray(np.full((180, 320, 3), index * 20000, dtype=np.uint16), format="rgb48le")
+                frame = av.VideoFrame.from_ndarray(np.broadcast_to(np.linspace(0, 62000, 320, dtype=np.uint16)[None, :, None], (180, 320, 3)).copy(), format="rgb48le")
                 frame.pts, frame.time_base, frame.duration = index, time_base, 1
                 for packet in stream.encode(frame):
                     mux_checked(packet)
@@ -328,12 +328,49 @@ class RealMedia(unittest.TestCase):
         self.assertEqual(len(packet_times), 2)
         with av.open(str(source)) as container:
             self.assertEqual([frame.pts * frame.time_base for frame in container.decode(video=0)], [0, time_base])
+        return source
+
+    def test_export_hdr10_transfer_primaries_matrix_depth_retained(self):
+        source = self.hdr_fixture("pq")
         output = self.output("-hdr-result.mov")
         self.export_cpu(source, output, {"amount": 0.2})
         video = media._video(media._probe(output))
         self.assertEqual((video["color_transfer"], video["color_primaries"], video["color_space"]),
                          ("smpte2084", "bt2020", "bt2020nc"))
         self.assertEqual(media.inspect_media(output)["bit_depth"], 10)
+
+    def check_hdr_proxy(self, transfer):
+        import av
+        import numpy as np
+        from PIL import Image
+        source = self.hdr_fixture(transfer)
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        self.assertEqual(media.inspect_media(source)["transfer"], transfer)
+        output, poster = self.output("-sdr.mp4"), self.output("-sdr.jpg")
+        media.make_proxy(source, output, poster)
+        info = media.inspect_media(output)
+        self.assertEqual((info["codec"], info["width"], info["height"], info["bit_depth"]), ("h264", 320, 180, 8))
+        self.assertEqual((info["color_transfer"], info["color_primaries"], info["color_space"], info["color_range"]),
+                         ("bt709", "bt709", "bt709", "tv"))
+        with Image.open(poster) as image:
+            image.load()
+            self.assertEqual((image.format, image.size), ("JPEG", (320, 180)))
+        with av.open(str(output)) as container:
+            frames = list(container.decode(video=0))
+        self.assertEqual(len(frames), 2)
+        display = frames[0].to_ndarray(format="rgb24")
+        with av.open(str(source)) as container:
+            signal = next(container.decode(video=0)).to_ndarray(format="rgb24")
+        self.assertGreater(int(display.max()) - int(display.min()), 64, "Tone-mapped preview must retain the HDR ramp")
+        self.assertGreater(float(np.abs(display.astype(np.float32) - signal.astype(np.float32)).mean()), 2,
+                           "HDR proxy must tone map pixels rather than relabel the HDR signal")
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), source_hash)
+
+    def test_pq_proxy_tonemaps_to_sdr_and_preserves_source(self):
+        self.check_hdr_proxy("pq")
+
+    def test_hlg_proxy_tonemaps_to_sdr_and_preserves_source(self):
+        self.check_hdr_proxy("hlg")
 
     def test_export_match_two_audio_tracks_and_source_unchanged(self):
         output = self.output(".mov")

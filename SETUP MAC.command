@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 cd "$ROOT"
-export PATH="/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="/opt/homebrew/opt/ffmpeg-full/bin:/opt/homebrew/opt/node@22/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 fail() { printf '\nSetup stopped: %s\nSee docs/MACOS.md.\n' "$*" >&2; exit 1; }
 trap 'printf "\nSetup did not complete. Resolve the error above, then run SETUP MAC.command again.\n" >&2' ERR
@@ -41,10 +41,14 @@ PY
 command -v node >/dev/null 2>&1 || fail "Install Node.js 22. With Homebrew: brew install node@22"
 command -v npm >/dev/null 2>&1 || fail "npm is missing. Reinstall Node.js 22."
 node -e 'const [major,minor]=process.versions.node.split(".").map(Number); if(major!==22 || minor<12 || process.arch!=="arm64") {console.error("Use native arm64 Node.js 22.12 or newer in the 22.x series.");process.exit(1)}'
-command -v ffmpeg >/dev/null 2>&1 || fail "Install FFmpeg. With Homebrew: brew install ffmpeg"
-command -v ffprobe >/dev/null 2>&1 || fail "ffprobe is missing. Reinstall FFmpeg."
+command -v ffmpeg >/dev/null 2>&1 || fail "Install the HDR-capable build: brew install ffmpeg-full"
+command -v ffprobe >/dev/null 2>&1 || fail "ffprobe is missing. Install the full build: brew install ffmpeg-full"
 ffmpeg -version >/dev/null
 ffprobe -version >/dev/null
+ffmpeg_filters="$(ffmpeg -hide_banner -filters 2>/dev/null)" || fail "Could not inspect the selected FFmpeg filters."
+for required_filter in zscale tonemap; do
+    printf '%s\n' "$ffmpeg_filters" | awk -v wanted="$required_filter" '$2 == wanted { found=1 } END { exit !found }' || fail "Selected FFmpeg ($(command -v ffmpeg)) lacks the $required_filter HDR preview filter. Run: brew install ffmpeg-full. These launchers prefer its keg-only bin directory without changing global links."
+done
 
 if [[ -e "$ROOT/.venv-studio" ]]; then
     [[ -x "$ROOT/.venv-studio/bin/python" ]] || fail "Existing .venv-studio is not a usable Mac environment. Move it aside manually; setup will not delete it."

@@ -296,33 +296,66 @@ class CpuTests(unittest.TestCase):
             renderer(too_large)
 
     @unittest.skipUnless(STRESS_8K, "use --8k during an exclusive GPU interval")
-    def test_full_8k_cuda_memory(self):
-        if self.device != "cuda":
-            self.skipTest("8K allocator stress is CUDA-only")
+    def test_full_8k_accelerator_memory(self):
+        if self.device not in {"cuda", "mps"}:
+            self.skipTest("Opt-in 8K stress requires CUDA or Metal MPS")
+        synchronize = torch.cuda.synchronize if self.device == "cuda" else torch.mps.synchronize
         renderer = StudioRenderer({**PROFILES["vintage"], "bokeh": .35})
         renderer(torch.full((3, 96, 160), .3, device=self.device))
-        torch.cuda.synchronize()
+        synchronize()
         frame = torch.full((3, 4320, 7680), .18, device=self.device)
         frame[:, 1800:2100, 4500:4750] = .98
-        torch.cuda.synchronize()
-        baseline = torch.cuda.memory_allocated()
-        torch.cuda.reset_peak_memory_stats()
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        wall = time.perf_counter(); start.record()
+        synchronize()
+        if self.device == "cuda":
+            baseline = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        else:
+            allocated_before = torch.mps.current_allocated_memory()
+            driver_before = torch.mps.driver_allocated_memory()
+            recommended = torch.mps.recommended_max_memory()
+        wall = time.perf_counter()
+        if self.device == "cuda":
+            start.record()
         result = renderer(frame, 11, 11 / 30)
-        end.record(); torch.cuda.synchronize()
+        if self.device == "cuda":
+            end.record()
+        synchronize()
         elapsed = time.perf_counter() - wall
-        peak = torch.cuda.max_memory_allocated()
+        if self.device == "cuda":
+            peak = torch.cuda.max_memory_allocated()
+        else:
+            allocated_after = torch.mps.current_allocated_memory()
+            driver_after = torch.mps.driver_allocated_memory()
         self.assertEqual(tuple(result.shape), (3, 4320, 7680))
         self.assertEqual(result.dtype, torch.float32)
+        self.assertEqual(result.device, frame.device)
         self.assertTrue(bool(torch.isfinite(result).all()))
         self.assertGreaterEqual(float(result.min()), 0)
         self.assertLessEqual(float(result.max()), 1)
-        self.assertLess(peak, 22 * 1024**3)
+        if self.device == "cuda":
+            self.assertLess(peak, 22 * 1024**3)
+        else:
+            for value in (allocated_before, allocated_after, driver_before, driver_after, recommended):
+                self.assertGreaterEqual(value, 0)
         self.assertEqual(renderer._geometry_key[1:], (4320, 7680))
         self.assertEqual(sum(v.numel() for v in renderer._geometry.values()), 12000)
-        print(f"\n8K effect-only: CUDA {start.elapsed_time(end):.2f}ms, wall {elapsed:.3f}s, "
-              f"peak total {peak / 1024**3:.3f}GiB, incremental {(peak-baseline) / 1024**3:.3f}GiB")
+        # Five exact constant-region checks cover every input pixel, without
+        # retaining an additional 380MiB full-RGB clone during the stress render.
+        for region in (frame[:, :1800], frame[:, 2100:], frame[:, 1800:2100, :4500],
+                       frame[:, 1800:2100, 4750:]):
+            self.assertTrue(bool((region == .18).all()), "Renderer changed the input background")
+        self.assertTrue(bool((frame[:, 1800:2100, 4500:4750] == .98).all()),
+                        "Renderer changed the input highlight")
+        if self.device == "cuda":
+            print(f"\n8K effect-only: CUDA {start.elapsed_time(end):.2f}ms, wall {elapsed:.3f}s, "
+                  f"peak total {peak / 1024**3:.3f}GiB, incremental {(peak-baseline) / 1024**3:.3f}GiB")
+        else:
+            print(f"\n8K effect-only: MPS wall {elapsed:.3f}s, input unchanged; "
+                  f"current allocated before/after {allocated_before / 1024**3:.3f}/{allocated_after / 1024**3:.3f}GiB, "
+                  f"driver before/after {driver_before / 1024**3:.3f}/{driver_after / 1024**3:.3f}GiB, "
+                  f"recommended {recommended / 1024**3:.3f}GiB. "
+                  "MPS figures are endpoint observations, not a measured peak.")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")

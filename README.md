@@ -75,9 +75,9 @@ versions and troubleshooting.
 
 Effects select CUDA, then Apple Metal/MPS, then CPU when using the default
 `STUDIO_DEVICE=auto`. CPU rendering is supported and can be much slower.
-An explicitly requested unavailable accelerator reports an error. Mac support
-is implemented with conditional tests; the Windows/CUDA results below do not
-establish Mac hardware performance or 8K throughput.
+An explicitly requested unavailable accelerator reports an error. Native 8K
+10-bit HEVC processing and lossless export have also been verified on an Apple
+M4 Mac mini with 16 GB RAM. See [the measured 8K results](docs/MACOS.md#8k-validation-on-apple-m4); lossless export is a batch process, not real-time playback.
 
 ### Windows / NVIDIA CUDA
 

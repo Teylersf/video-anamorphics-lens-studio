@@ -100,9 +100,23 @@ jobs:
       - name: Provide FFmpeg prerequisites
         shell: bash
         run: |
-          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
-            brew install ffmpeg
+          set -euo pipefail
+          ffmpeg_full_bin="$(brew --prefix)/opt/ffmpeg-full/bin"
+          export PATH="$ffmpeg_full_bin:$PATH"
+          have_hdr_filters() {
+            command -v ffmpeg >/dev/null && command -v ffprobe >/dev/null || return 1
+            local filters
+            filters="$(ffmpeg -hide_banner -filters 2>/dev/null)" || return 1
+            printf '%s\n' "$filters" | awk '$2 == "zscale" { z=1 } $2 == "tonemap" { t=1 } END { exit !(z && t) }'
+          }
+          if ! have_hdr_filters; then
+            brew install ffmpeg-full
           fi
+          if ! have_hdr_filters; then
+            printf 'Selected FFmpeg still lacks zscale/tonemap after installing ffmpeg-full.\n' >&2
+            exit 1
+          fi
+          printf '%s\n' "$ffmpeg_full_bin" >> "$GITHUB_PATH"
           ffmpeg -version
           ffprobe -version
       - name: Run the actual Mac setup without starting Studio
