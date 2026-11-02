@@ -160,8 +160,13 @@ jobs:
                       return json.load(response)
               except (OSError, ValueError):
                   return None
+          def process_live(pid):
+              result = subprocess.run(['ps', '-p', str(pid), '-o', 'stat='],
+                                      capture_output=True, text=True, timeout=5)
+              state = result.stdout.strip()
+              return result.returncode == 0 and bool(state) and not state.startswith('Z')
           def owned_server(pid):
-              result = subprocess.run(['ps', '-p', str(pid), '-o', 'stat=', '-o', 'command='],
+              result = subprocess.run(['ps', '-ww', '-p', str(pid), '-o', 'stat=', '-o', 'command='],
                                       capture_output=True, text=True, timeout=5)
               fields = result.stdout.strip().split(maxsplit=1)
               if not fields or fields[0].startswith('Z'):
@@ -170,8 +175,11 @@ jobs:
               expected = str(root / '.venv-studio/bin/python')
               if not command.startswith(expected + ' ') or 'tools/anamorphic-studio/server.py' not in command:
                   raise RuntimeError('Refusing to signal a PID that is not this checkout\'s server')
-              if os.getpgid(pid) != pid:
-                  raise RuntimeError('Expected the owned server to have its own POSIX session')
+              try:
+                  if os.getpgid(pid) != pid:
+                      raise RuntimeError('Expected the owned server to have its own POSIX session')
+              except ProcessLookupError:
+                  return False
               return True
           assert status() is None, 'A pre-existing service must not be reused or stopped'
           assert not pidfile.exists(), 'CI lifecycle requires a fresh owned PID record'
@@ -195,23 +203,40 @@ jobs:
               except subprocess.TimeoutExpired:
                   pass
               # Stop the known launcher session first so it cannot create a late server.
-              try:
-                  os.killpg(launcher.pid, signal.SIGTERM)
-                  time.sleep(.2)
-                  os.killpg(launcher.pid, signal.SIGKILL)
-              except ProcessLookupError:
-                  pass
+              if launcher.poll() is None:
+                  try:
+                      os.killpg(launcher.pid, signal.SIGTERM)
+                      time.sleep(.2)
+                      if launcher.poll() is None:
+                          os.killpg(launcher.pid, signal.SIGKILL)
+                  except ProcessLookupError:
+                      pass
               launcher.wait(timeout=5)
               if pidfile.exists():
                   pid = int(pidfile.read_text().strip())
                   assert pid > 1
-                  if owned_server(pid):
-                      os.killpg(pid, signal.SIGTERM)
+                  # HTTP closes before Python finishes interpreter shutdown.
+                  # Wait for exit/zombie without trying to identify a dying PID.
+                  deadline = time.monotonic() + 10
+                  while process_live(pid) and time.monotonic() < deadline:
+                      time.sleep(.2)
+                  if process_live(pid) and owned_server(pid):
+                      try:
+                          os.killpg(pid, signal.SIGTERM)
+                      except ProcessLookupError:
+                          pass
                       deadline = time.monotonic() + 5
-                      while owned_server(pid) and time.monotonic() < deadline:
+                      while process_live(pid) and time.monotonic() < deadline:
                           time.sleep(.2)
-                      if owned_server(pid):
-                          os.killpg(pid, signal.SIGKILL)
+                      if process_live(pid) and owned_server(pid):
+                          try:
+                              os.killpg(pid, signal.SIGKILL)
+                          except ProcessLookupError:
+                              pass
+                  deadline = time.monotonic() + 5
+                  while process_live(pid) and time.monotonic() < deadline:
+                      time.sleep(.2)
+                  assert not process_live(pid), 'Owned CI server did not exit after cleanup'
               assert status() is None, 'Owned CI service remains reachable after cleanup'
           PY
       - name: Show service diagnostics on failure
