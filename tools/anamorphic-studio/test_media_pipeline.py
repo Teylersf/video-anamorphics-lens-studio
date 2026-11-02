@@ -293,22 +293,41 @@ class RealMedia(unittest.TestCase):
     def test_export_hdr10_transfer_primaries_matrix_depth_retained(self):
         import av
         import numpy as np
+        from fractions import Fraction
         source = self.output("-hdr.mov")
+        time_base = Fraction(1, 30)
+        packet_times = []
         with av.open(str(source), "w") as container:
             stream = container.add_stream("libx265", rate=30)
             stream.width, stream.height, stream.pix_fmt = 320, 180, "yuv420p10le"
-            stream.options = {"x265-params": "log-level=error"}
+            # A two-frame color fixture needs no frame reordering. Leaving
+            # libx265's B-frame defaults/timestamps inferred produced sporadic
+            # huge negative DTS values, including on the Windows build.
+            stream.time_base = stream.codec_context.time_base = time_base
+            stream.codec_context.max_b_frames = 0
+            stream.options = {"x265-params": "log-level=error:bframes=0"}
             stream.codec_context.color_trc = 16
             stream.codec_context.color_primaries = 9
             stream.codec_context.colorspace = 9
             stream.codec_context.color_range = 1
+            def mux_checked(packet):
+                self.assertIsNotNone(packet.pts)
+                self.assertIsNotNone(packet.dts)
+                times = (packet.pts * packet.time_base, packet.dts * packet.time_base)
+                point = len(packet_times) * time_base
+                self.assertEqual(times, (point, point), "HDR fixture must have explicit ordered PTS/DTS")
+                packet_times.append(times)
+                container.mux(packet)
             for index in range(2):
                 frame = av.VideoFrame.from_ndarray(np.full((180, 320, 3), index * 20000, dtype=np.uint16), format="rgb48le")
-                frame.pts = index
+                frame.pts, frame.time_base, frame.duration = index, time_base, 1
                 for packet in stream.encode(frame):
-                    container.mux(packet)
+                    mux_checked(packet)
             for packet in stream.encode():
-                container.mux(packet)
+                mux_checked(packet)
+        self.assertEqual(len(packet_times), 2)
+        with av.open(str(source)) as container:
+            self.assertEqual([frame.pts * frame.time_base for frame in container.decode(video=0)], [0, time_base])
         output = self.output("-hdr-result.mov")
         self.export_cpu(source, output, {"amount": 0.2})
         video = media._video(media._probe(output))
