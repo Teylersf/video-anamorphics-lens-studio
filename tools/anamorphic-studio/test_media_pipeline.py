@@ -150,8 +150,15 @@ class RealMedia(unittest.TestCase):
         cls.source = cls.folder / "source.mov"
         subprocess.run([media.FFMPEG, "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30000/1001",
                         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000",
-                        "-t", "0.2", "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                        "-color_trc", "bt709", "-color_primaries", "bt709", "-colorspace", "bt709", "-c:a", "pcm_s16le", str(cls.source)], check=True)
+                        "-t", "0.2", "-map", "0:v", "-map", "1:a", "-map", "2:a",
+                        # Set frame properties and encoded SPS explicitly. The
+                        # Homebrew FFmpeg 9 fixture lost generic output-only
+                        # color options, unlike the Windows FFmpeg 7 build.
+                        "-vf", "setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        "-color_trc", "bt709", "-color_primaries", "bt709", "-colorspace", "bt709",
+                        "-bsf:v", "h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1",
+                        "-c:a", "pcm_s16le", str(cls.source)], check=True)
         cls.source_hash = hashlib.sha256(cls.source.read_bytes()).hexdigest()
 
     @classmethod
@@ -171,6 +178,17 @@ class RealMedia(unittest.TestCase):
         self.assertEqual((info["width"], info["height"], info["bit_depth"]), (320, 180, 8))
         self.assertEqual(info["audio_streams"], 2)
         self.assertEqual(info["color_primaries"], "bt709")
+
+    def test_fixture_encoded_bitstream_contains_bt709_tags(self):
+        """Check SPS tags independently of inspect_media and MOV color atoms."""
+        import av
+        bitstream = self.output("-fixture.h264")
+        subprocess.run([media.FFMPEG, "-v", "error", "-n", "-i", str(self.source),
+                        "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "h264_mp4toannexb",
+                        str(bitstream)], check=True, timeout=30)
+        with av.open(str(bitstream), format="h264") as container:
+            frame = next(container.decode(video=0))
+            self.assertEqual((frame.color_primaries, frame.color_trc, frame.colorspace), (1, 1, 1))
 
     def test_proxy_and_poster_decode(self):
         output, poster = self.output(".mp4"), self.output(".jpg")
@@ -359,6 +377,31 @@ class RealMedia(unittest.TestCase):
                         return [Fraction(frame.pts) * frame.time_base for frame in container.decode(video=0)]
                 self.assertEqual(decoded_times(source), decoded_times(output))
                 self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), before_hash)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Actual Metal end-to-end integration requires macOS")
+    def test_actual_mac_metal_video_export(self):
+        import av
+        import torch
+        from fractions import Fraction
+        if not torch.backends.mps.is_available():
+            self.skipTest("This Mac runner has no available Metal MPS device")
+        output = self.output("-metal.mp4")
+        # Do not force a software encoder: this is the normal Mac pipeline,
+        # Metal effects plus probed VideoToolbox or its software fallback.
+        with mock.patch.dict(os.environ, {"STUDIO_DEVICE": "mps"}):
+            result = media.export_video(self.source, output, {"amount": 0.2}, mode="hevc")
+        self.assertEqual(result["backend"]["device"], "mps")
+        self.assertTrue(result["backend"]["accelerated"])
+        self.assertIn(result["encoder"], ("hevc_videotoolbox", "libx265"))
+        self.assertEqual((result["codec"], result["width"], result["height"], result["frames"], result["bit_depth"]),
+                         ("hevc", 320, 180, 6, 8))
+        self.assertEqual(result["fps_exact"], "30000/1001")
+        self.assertEqual((result["audio_streams"], result["audio"]), (2, "AAC"))
+        def decoded_times(path):
+            with av.open(str(path)) as container:
+                return [Fraction(frame.pts) * frame.time_base for frame in container.decode(video=0)]
+        self.assertEqual(decoded_times(self.source), decoded_times(output))
+        self.assertEqual(hashlib.sha256(self.source.read_bytes()).hexdigest(), self.source_hash)
 
     def test_export_vfr_keeps_presentation_times(self):
         import av
